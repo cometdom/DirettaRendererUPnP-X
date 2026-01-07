@@ -1,49 +1,53 @@
-# Fork Changes from Original v1.1.2
+# Fork Changes: DirettaRendererUPnP-X vs 1.2.1
 
-This document describes the architectural changes and improvements made in this fork of DirettaRendererUPnP.
-
-## Overview
-
-This fork refactors the Diretta integration to use the lower-level `DIRETTA::Sync` API  instead of `DIRETTA::SyncBuffer`, providing better control over audio streaming and improved reliability.
+This document describes the architectural changes and differences between this fork (DirettaRendererUPnP-X) and the original DirettaRendererUPnP v1.2.1.
 
 ## Summary
 
-| Metric | Original v1.1.2 | This Fork | Change |
-|--------|-----------------|-----------|--------|
-| Total lines of code | 6,410 | 6,209 | -3% |
-| Core Diretta files | 2,079 lines | 1,939 lines | -7% |
+| Metric | Original (1.2.1) | This Fork (X) | Change |
+|--------|------------------|---------------|--------|
+| Total lines of code | 7,104 | 6,474 | -9% (-630 lines) |
+| DirettaRenderer | 1,058 lines | 697 lines | -34% |
+| Diretta core files | 1,655 lines | 1,733 lines | +5% (better separation) |
 | SDK API | `DIRETTA::SyncBuffer` | `DIRETTA::Sync` | Lower-level |
 | Architecture | 2-class design | 3-class design | Cleaner separation |
+| Version | 1.2.1 "Gapless Pro" | 1.2.0-simplified | Refactored |
 
 ---
 
 ## Architectural Changes
 
-### Original v1.1.2 Structure
+### Original 1.2.1 Structure
 
 ```
 src/
-├── DirettaOutput.cpp    (1,167 lines) - Connection, format, buffering
-├── DirettaOutput.h      (201 lines)
-├── DirettaRenderer.cpp  (912 lines)   - UPnP + threading + callbacks
+├── DirettaOutput.cpp    (1,370 lines) - Connection, format, gapless, buffering
+├── DirettaOutput.h      (285 lines)
+├── DirettaRenderer.cpp  (957 lines)   - UPnP + threading + callbacks + gapless
 ├── DirettaRenderer.h    (101 lines)
-├── AudioEngine.cpp/h
-├── UPnPDevice.cpp/hpp
-└── main.cpp
+├── AudioEngine.cpp      (1,810 lines)
+├── AudioEngine.h        (414 lines)
+├── UPnPDevice.cpp       (1,403 lines)
+├── UPnPDevice.hpp       (185 lines)
+├── ProtocolInfoBuilder.h (289 lines)
+└── main.cpp             (290 lines)
 ```
 
 ### This Fork Structure
 
 ```
 src/
-├── DirettaSync.cpp      (1,114 lines) - Unified adapter (inherits DIRETTA::Sync)
-├── DirettaSync.h        (329 lines)
+├── DirettaSync.cpp      (1,150 lines) - Unified adapter (inherits DIRETTA::Sync)
+├── DirettaSync.h        (331 lines)
 ├── DirettaRingBuffer.h  (252 lines)   - Extracted lock-free ring buffer
-├── DirettaRenderer.cpp  (573 lines)   - Simplified orchestrator
-├── DirettaRenderer.h    (85 lines)
-├── AudioEngine.cpp/h
-├── UPnPDevice.cpp/hpp
-└── main.cpp
+├── DirettaRenderer.cpp  (613 lines)   - Simplified orchestrator
+├── DirettaRenderer.h    (84 lines)
+├── AudioEngine.cpp      (1,710 lines)
+├── AudioEngine.h        (356 lines)
+├── UPnPDevice.cpp       (1,343 lines)
+├── UPnPDevice.hpp       (178 lines)
+├── ProtocolInfoBuilder.h (289 lines)
+└── main.cpp             (168 lines)
 ```
 
 ---
@@ -52,79 +56,97 @@ src/
 
 ### 1. SDK API Approach
 
-| Aspect | Original | This Fork |
-|--------|----------|-----------|
+| Aspect | Original (1.2.1) | This Fork (X) |
+|--------|------------------|---------------|
 | Base class | Uses `DIRETTA::SyncBuffer` | Inherits from `DIRETTA::Sync` |
-| Model | Push-only | Push/pull hybrid |
+| Model | Push-only (write to buffer) | Push/pull hybrid |
 | Buffer control | SDK manages internally | App manages via DirettaRingBuffer |
-| Timing control | Limited | Full control via `getNewStream()` override |
+| Timing control | SDK-controlled | Full control via `getNewStream()` override |
+| Gapless method | SDK native (`writeStreamStart`/`addStream`) | Ring buffer continuous feed |
 
-**Original approach:**
+**Original 1.2.1 approach:**
 ```cpp
 m_syncBuffer = std::make_unique<DIRETTA::SyncBuffer>();
 m_syncBuffer->open(...);
 m_syncBuffer->write(data, size);
+
+// Gapless Pro:
+m_syncBuffer->writeStreamStart(stream);
+m_syncBuffer->addStream(nextTrackStream);
 ```
 
 **This fork approach:**
 ```cpp
 class DirettaSync : public DIRETTA::Sync {
     bool getNewStream(DIRETTA::Stream& stream) override {
-        // Pull data from ring buffer
+        // Pull data from ring buffer on SDK request
         m_ringBuffer.pop(dest, bytesNeeded);
         return true;
     }
 };
+
+// Push data to ring buffer
+m_ringBuffer.push(data, size);
 ```
 
-### 2. Format Configuration
+### 2. Features in 1.2.1 NOT in This Fork
 
-**Original** - Raw FormatID bit flags:
-```cpp
-DIRETTA::FormatID formatID;
-formatID = DIRETTA::FormatID::FMT_DSD1 | DIRETTA::FormatID::FMT_DSD_SIZ_32;
-formatID |= DIRETTA::FormatID::FMT_DSD_LSB;
-formatID |= DIRETTA::FormatID::FMT_DSD_LITTLE;
+| Feature | Description |
+|---------|-------------|
+| SDK gapless methods | Uses `writeStreamStart()`/`addStream()` (same result as X) |
+| Buffer seconds config | `--buffer` CLI option (default 2.0s) |
+| Advanced SDK settings | `--thread-mode`, `--cycle-time`, `--cycle-min-time`, `--info-cycle` |
+| MTU override | `--mtu` CLI option |
+| Network optimization | `optimizeNetworkConfig()` per format (DSD/Hi-Res/Standard) |
+| Bind IP option | `--bind-ip` in addition to `--interface` |
+| SSDP thread | Separate thread for SSDP handling |
+
+### 3. Features in This Fork NOT in 1.2.1
+
+| Feature | Description |
+|---------|-------------|
+| DirettaRingBuffer | Extracted reusable ring buffer class |
+| Pull model support | `getNewStream()` override for SDK callback |
+| DSD byte swap | `m_needDsdByteSwap` for LITTLE endian targets |
+| Cycle calculator | `DirettaCycleCalculator` class for timing |
+| Format reopen | `reopenForFormatChange()` with silence buffers |
+| Transfer modes | Explicit `DirettaTransferMode` enum |
+| Buffer config | `DirettaBuffer` namespace with tuning constants |
+
+### 4. Command-Line Options Comparison
+
+**Original 1.2.1:**
+```
+--name, -n          Device name
+--port, -p          UPnP port
+--target, -t        Target index
+--buffer, -b        Buffer seconds (float)
+--no-gapless        Disable gapless
+--thread-mode       SDK thread mode
+--cycle-time        Cycle time (µs)
+--cycle-min-time    Minimum cycle time
+--info-cycle        Info cycle time
+--mtu               MTU override
+--interface         Network interface
+--bind-ip           Bind to IP address
+--list-targets, -l  List targets
+--verbose, -v       Verbose logging
+--help, -h          Help
 ```
 
-**This fork** - FormatConfigure class with validation:
-```cpp
-DIRETTA::FormatConfigure fmt;
-fmt.setSpeed(dsdBitRate);
-fmt.setChannel(channels);
-fmt.setFormat(DIRETTA::FormatID::FMT_DSD1 |
-              DIRETTA::FormatID::FMT_DSD_SIZ_32 |
-              DIRETTA::FormatID::FMT_DSD_LSB |
-              DIRETTA::FormatID::FMT_DSD_BIG);
-
-if (checkSinkSupport(fmt)) {
-    setSinkConfigure(fmt);
-}
+**This fork (X):**
+```
+--name, -n          Device name
+--port, -p          UPnP port
+--target, -t        Target index
+--no-gapless        Disable gapless
+--interface         Network interface
+--list-targets, -l  List targets
+--verbose, -v       Verbose logging
+--help, -h          Help
 ```
 
-### 3. DSD Handling Improvements
-
-| Feature | Original | This Fork |
-|---------|----------|-----------|
-| Source format detection | Basic codec check | Full DSF/DFF detection via `AudioFormat::DSDFormat` |
-| Bit reversal decision | Always reverse if target is MSB | Compare source (DSF=LSB, DFF=MSB) vs target |
-| Byte endianness | Partial LITTLE support | Full byte swap for LITTLE endian targets |
-| Format change handling | Light reconfigure | Full reopen + 100 silence buffers |
-
-**Bit reversal logic (this fork):**
-```cpp
-bool sourceIsLSB = (format.dsdFormat == AudioFormat::DSDFormat::DSF);
-
-// Target is MSB | BIG
-m_needDsdBitReversal = sourceIsLSB;  // Reverse if source is LSB (DSF)
-m_needDsdByteSwap = false;           // BIG endian = no swap
-
-// Target is MSB | LITTLE
-m_needDsdBitReversal = sourceIsLSB;  // Reverse if source is LSB (DSF)
-m_needDsdByteSwap = true;            // LITTLE endian = swap bytes
-```
-
-### 4. Ring Buffer Extraction
+### 5. Ring Buffer Extraction
 
 The ring buffer is now a separate, reusable class with specialized push methods:
 
@@ -147,9 +169,20 @@ class DirettaRingBuffer {
 };
 ```
 
-### 5. Format Transition Handling
+### 6. Format Transition Handling
 
-**Original:** Light reconfigure attempt, may fail on some targets
+**Original 1.2.1:** Light reconfigure with network optimization
+```cpp
+void DirettaOutput::optimizeNetworkConfig(const AudioFormat& format) {
+    if (format.isDSD) {
+        // VarMax for DSD
+    } else if (format.sampleRate >= 192000) {
+        // Adaptive for Hi-Res
+    } else {
+        // Fixed for standard
+    }
+}
+```
 
 **This fork:** Full `reopenForFormatChange()`:
 ```cpp
@@ -178,68 +211,69 @@ bool DirettaSync::reopenForFormatChange() {
 
 ---
 
-## Bug Fixes
+## DSD Handling Comparison
 
-### 1. Duplicate `av_seek_frame()` Calls
-**File:** `AudioEngine.cpp:340-344`
-**Issue:** DSD diagnostic code had seek-back duplicated
-**Fix:** Removed duplicate block
-
-### 2. Duplicate `DEBUG_LOG` Statements
-**File:** `AudioEngine.cpp:453-463`
-**Issue:** PCM format info logged twice, first without semicolon
-**Fix:** Removed malformed duplicate
-
-### 3. Static Variable in Lambda
-**File:** `DirettaRenderer.cpp:272`
-**Issue:** `static lastStopTime` inside `start()` is unconventional
-**Fix:** Moved to member variable `m_lastStopTime`
-
-### 4. Redundant Assignment
-**File:** `AudioEngine.cpp:389`
-**Issue:** `m_rawDSD = false` assigned twice in PCM path
-**Fix:** Removed duplicate at line 389
-
-### 5. DSD White Noise on Some Targets
-**Issue:** Source format (DSF/DFF) not considered when deciding bit reversal
-**Fix:** Pass `AudioFormat` to `configureSinkDSD()`, compare source vs target bit order
-
-### 6. Loud Cracks on DSD Format Change
-**Issue:** No silence padding before format switch
-**Fix:** Added 100 silence buffers for DSD in `reopenForFormatChange()`
+| Feature | Original (1.2.1) | This Fork (X) |
+|---------|------------------|---------------|
+| Source format detection | DSF/DFF via extension | DSF/DFF via extension |
+| Bit reversal flag | `m_needDsdBitReversal` | `m_needDsdBitReversal` |
+| Byte swap support | No | Yes (`m_needDsdByteSwap`) |
+| Format propagation | `TrackInfo::DSDSourceFormat` | `AudioFormat::DSDFormat` |
 
 ---
 
-## Files Changed
+## Bug Fixes (Common to Both)
 
-| File | Status | Notes |
-|------|--------|-------|
-| `DirettaOutput.cpp/h` | **Removed** | Merged into DirettaSync |
-| `DirettaSync.cpp/h` | **New** | Unified adapter inheriting DIRETTA::Sync |
-| `DirettaRingBuffer.h` | **New** | Extracted lock-free ring buffer |
-| `DirettaRenderer.cpp` | **Modified** | Simplified, -37% code |
-| `DirettaRenderer.h` | **Modified** | Added `m_lastStopTime` member |
-| `AudioEngine.cpp` | **Modified** | Bug fixes (duplicates removed) |
-| `main.cpp` | **Modified** | Simplified options |
+### 1. DSD Source Format Detection
+**Issue:** Source format (DSF/DFF) not considered when deciding bit reversal
+**Fix:** Detect format from file extension, pass to Diretta configuration
+
+### 2. Multi-Interface Support
+**Issue:** `--interface` option parsed but ignored
+**Fix:** Propagate `networkInterface` to UPnPDevice config
+
+---
+
+## Files Changed Summary
+
+| File | 1.2.1 | X | Status |
+|------|-------|---|--------|
+| `DirettaOutput.cpp/h` | 1,655 | - | **Removed** (merged into DirettaSync) |
+| `DirettaSync.cpp/h` | - | 1,481 | **New** |
+| `DirettaRingBuffer.h` | - | 252 | **New** |
+| `DirettaRenderer.cpp/h` | 1,058 | 697 | **Simplified** (-34%) |
+| `AudioEngine.cpp/h` | 2,224 | 2,066 | **Modified** (-7%) |
+| `UPnPDevice.cpp/hpp` | 1,588 | 1,521 | **Modified** (-4%) |
+| `main.cpp` | 290 | 168 | **Simplified** (-42%) |
 
 ---
 
 ## Compatibility
 
-- **Command-line interface:** Unchanged
-- **UPnP behavior:** Unchanged
-- **Control points:** Same compatibility
-- **SDK requirement:** Same (Diretta Host SDK v1.47)
+| Aspect | Compatibility |
+|--------|---------------|
+| Command-line interface | Partial (fewer advanced options) |
+| UPnP behavior | Unchanged |
+| Control points | Same compatibility |
+| SDK requirement | Same (Diretta Host SDK v1.47) |
+| Gapless playback | Equivalent performance, different implementation |
 
 ---
 
-## Testing
+## When to Use Which Version
 
-Tested with:
-- PCM: FLAC, ALAC, WAV (44.1kHz - 384kHz, 16/24/32-bit)
-- DSD: DSF and DFF files (DSD64, DSD128, DSD256, DSD512)
-- Format transitions: PCM↔PCM, DSD↔DSD, PCM↔DSD
-- Control points: JPlay, mconnect
+**Use Original 1.2.1 if you need:**
+- Advanced SDK tuning options (`--thread-mode`, `--cycle-time`, etc.)
+- Network optimization per format (VarMax/Adaptive/Fixed)
+- Configurable buffer size (`--buffer`)
+
+**Use This Fork (X) if you need:**
+- Cleaner, more maintainable codebase
+- Lower-level SDK control via `DIRETTA::Sync`
+- DSD byte swap for LITTLE endian targets
+- Better format transition reliability (full reopen with silence buffers)
+
+**Note:** Both versions achieve equivalent gapless playback performance through different implementations.
 
 ---
 
