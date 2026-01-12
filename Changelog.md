@@ -1,4 +1,32 @@
-# Changelog 
+# Changelog
+
+## 2026-01-13
+
+### 1. DSD→PCM Transition Fix for I2S Targets
+
+- Added special handling in `DirettaSync::open()` for DSD→PCM format transitions
+- I2S/LVDS targets are more timing-sensitive than USB and need cleaner transitions
+- DSD→PCM now performs: full `DIRETTA::Sync::close()` + 800ms delay + fresh `open()`
+- Other format transitions (PCM→DSD, PCM→PCM, DSD→DSD) unchanged
+- **Files:** `src/DirettaSync.cpp` (lines 372-421)
+
+### 2. UPnP Stop Signal Handling
+
+- Diretta connection now properly closed when UPnP Stop action received
+- Ensures clean handoff when switching renderers
+- Pause action unchanged (keeps connection open)
+- **Files:** `src/DirettaRenderer.cpp` (lines 419-431)
+
+### 3. Enhanced Target Listing
+
+- `--list-targets` now shows detailed target information:
+  - Output name (e.g., "LVDS", "USB") - differentiates ports
+  - Port numbers (IN/OUT) and multiport flag
+  - SDK version
+  - Product ID
+- **Files:** `src/DirettaSync.cpp` (lines 269-325)
+
+---
 
 ## 2026-01-12 (thanks to @leeeanh)
 

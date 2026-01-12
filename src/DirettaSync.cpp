@@ -284,11 +284,37 @@ void DirettaSync::listTargets() {
         return;
     }
 
-    std::cout << "Available Diretta Targets (" << results.size() << " found):" << std::endl;
+    std::cout << "\nAvailable Diretta Targets (" << results.size() << " found):\n" << std::endl;
 
     int index = 1;
     for (const auto& target : results) {
-        std::cout << "[" << index << "] " << target.second.targetName << std::endl;
+        const auto& info = target.second;
+        std::cout << "[" << index << "] " << info.targetName << std::endl;
+
+        // Show output/port name if available (differentiates I2S vs USB, etc.)
+        if (!info.outputName.empty()) {
+            std::cout << "    Output: " << info.outputName << std::endl;
+        }
+
+        // Show port numbers
+        std::cout << "    Port: IN=" << info.PI << " OUT=" << info.PO;
+        if (info.multiport) {
+            std::cout << " (multiport)";
+        }
+        std::cout << std::endl;
+
+        // Show configuration URL if available
+        if (!info.config.empty()) {
+            std::cout << "    Config: " << info.config << std::endl;
+        }
+
+        // Show SDK version
+        std::cout << "    Version: " << info.version << std::endl;
+
+        // Show Product ID
+        std::cout << "    ProductID: 0x" << std::hex << info.productID << std::dec << std::endl;
+
+        std::cout << std::endl;
         index++;
     }
 
@@ -365,12 +391,67 @@ bool DirettaSync::open(const AudioFormat& format) {
             std::cout << "[DirettaSync] ========== OPEN COMPLETE (quick) ==========" << std::endl;
             return true;
         } else {
-            // Format change - need full reopen for reliable Target reconfiguration
-            // Some Targets need DIRETTA::Sync to be fully closed and reopened
-            std::cout << "[DirettaSync] Format change - full reopen" << std::endl;
-            if (!reopenForFormatChange()) {
-                std::cerr << "[DirettaSync] Failed to reopen for format change" << std::endl;
-                return false;
+            // Format change detected
+            bool wasDSD = m_previousFormat.isDSD;
+            bool nowPCM = !format.isDSD;
+
+            if (wasDSD && nowPCM) {
+                // DSD→PCM: Full close/reopen for clean I2S transition
+                // I2S targets are more timing-sensitive than USB and need a cleaner break
+                // Note: We can't send silence here because playback is already stopped
+                // (auto-stop happens before URI change), so getNewStream() isn't being called
+                std::cout << "[DirettaSync] DSD->PCM transition - full close/reopen for I2S compatibility" << std::endl;
+
+                int dsdMultiplier = m_previousFormat.sampleRate / 44100;
+                std::cout << "[DirettaSync] Previous format was DSD" << dsdMultiplier << std::endl;
+
+                // Clear any pending silence requests (playback is stopped, can't send anyway)
+                m_silenceBuffersRemaining = 0;
+
+                // Stop playback and disconnect
+                stop();
+                disconnect(true);
+
+                // Close DIRETTA::Sync completely (critical for DSD→PCM reset)
+                DIRETTA::Sync::close();
+
+                // Shutdown worker thread
+                m_running = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_workerMutex);
+                    if (m_workerThread.joinable()) {
+                        m_workerThread.join();
+                    }
+                }
+
+                m_open = false;
+                m_playing = false;
+                m_paused = false;
+
+                // Extended delay for I2S target to fully reset from DSD mode
+                // This is critical - the target needs time to switch from DSD clock to PCM clock
+                std::cout << "[DirettaSync] Waiting 800ms for I2S target to reset from DSD mode..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+                // Reopen DIRETTA::Sync fresh for PCM
+                ACQUA::Clock cycleTime = ACQUA::Clock::MicroSeconds(m_config.cycleTime);
+                if (!DIRETTA::Sync::open(
+                        DIRETTA::Sync::THRED_MODE(m_config.threadMode),
+                        cycleTime, 0, "DirettaRenderer", 0x44525400,
+                        -1, -1, 0, DIRETTA::Sync::MSMODE_MS3)) {
+                    std::cerr << "[DirettaSync] Failed to re-open DIRETTA::Sync after DSD->PCM" << std::endl;
+                    return false;
+                }
+                std::cout << "[DirettaSync] DIRETTA::Sync reopened for PCM" << std::endl;
+
+                // Fall through to full open path (needFullConnect is already true)
+            } else {
+                // Other format changes: use existing reopenForFormatChange()
+                std::cout << "[DirettaSync] Format change - reopen" << std::endl;
+                if (!reopenForFormatChange()) {
+                    std::cerr << "[DirettaSync] Failed to reopen for format change" << std::endl;
+                    return false;
+                }
             }
             needFullConnect = true;
         }
@@ -630,6 +711,10 @@ void DirettaSync::fullReset() {
         m_stabilizationCount = 0;
         m_streamCount = 0;
         m_pushCount = 0;
+
+        // Check if we're switching FROM DSD - need to purge buffer with PCM silence
+        bool wasDsd = m_isDsdMode.load(std::memory_order_acquire);
+
         m_isDsdMode.store(false, std::memory_order_release);
         m_needDsdBitReversal.store(false, std::memory_order_release);
         m_needDsdByteSwap.store(false, std::memory_order_release);
@@ -638,6 +723,13 @@ void DirettaSync::fullReset() {
         m_need16To32Upsample.store(false, std::memory_order_release);
 
         m_ringBuffer.clear();
+
+        // Critical: If switching from DSD, fill buffer with PCM silence (0x00)
+        // Otherwise getNewStream() may output DSD silence (0x69) as PCM = loud noise
+        if (wasDsd) {
+            DIRETTA_LOG("DSD->PCM: purging buffer with PCM silence");
+            m_ringBuffer.resize(m_ringBuffer.size(), 0x00);
+        }
     }
 
     m_stopRequested = false;

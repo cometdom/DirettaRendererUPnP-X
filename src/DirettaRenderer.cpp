@@ -416,13 +416,16 @@ bool DirettaRenderer::start() {
                 m_audioEngine->setCurrentURI(m_currentURI, m_currentMetadata, true);
             }
 
-            // Don't close DirettaSync here - keep connection alive for quick track transitions
-            // DirettaSync will only close on:
-            // - Format family change (PCM↔DSD) - handled in audio callback
-            // - App shutdown - handled in DirettaRenderer::stop()
+            // Close Diretta connection on Stop (not Pause) for proper resource cleanup
+            // This ensures:
+            // - Clean handoff when switching to a different renderer
+            // - Proper resource release on the Diretta target
+            // - Control point gets expected clean disconnection
+            // Trade-off: subsequent Play will need to reconnect (~300ms)
             if (m_direttaSync) {
                 m_direttaSync->stopPlayback(true);
-                // m_direttaSync->close();  // Removed - keep connection open
+                m_direttaSync->close();
+                std::cout << "[DirettaRenderer] Diretta connection closed on Stop" << std::endl;
             }
 
             m_upnp->notifyStateChange("STOPPED");
