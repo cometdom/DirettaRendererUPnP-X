@@ -61,8 +61,8 @@ alignas(64) uint8_t m_stagingDSD[STAGING_SIZE];
 
 **Why 64KB per buffer:**
 - Fits in Zen 4 L2 cache (1MB per core)
-- Covers ~340ms of 192kHz/24-bit stereo audio
-- Large enough for any realistic single push operation
+- Covers ~57ms of 192kHz/24-bit stereo audio (1.15MB/s)
+- Typical push operations are 180 bytes - 1.5KB (~1ms), so 64KB provides 40-350× headroom
 - Power of 2 for efficient indexing
 
 **Memory layout benefits:**
@@ -254,8 +254,8 @@ for (size_t i = 0; i < numBlocks; i++) {
         _mm_prefetch(src + (i + 2) * 32, _MM_HINT_T0);
     }
 
-    // Process current block
-    __m256i data = _mm256_load_si256((const __m256i*)(src + i * 32));
+    // Process current block (unaligned load - input buffers have no alignment guarantee)
+    __m256i data = _mm256_loadu_si256((const __m256i*)(src + i * 32));
     // ... conversion ...
 }
 ```
@@ -293,25 +293,33 @@ _mm256_storeu_si256(dst + 32, out1);
 
 **DSD planar-to-interleaved optimization:**
 
+Note: SIMD path is for **stereo only** (2 channels). Multi-channel DSD (4/6 channels) uses scalar fallback to preserve correct channel ordering.
+
 ```cpp
-// Process 32 bytes (8 × 4-byte groups) per iteration
-__m256i left  = _mm256_loadu_si256(src_L);
-__m256i right = _mm256_loadu_si256(src_R);
+// STEREO SIMD PATH: Process 32 bytes (8 × 4-byte groups) per iteration
+if (numChannels == 2) {
+    __m256i left  = _mm256_loadu_si256(src_L);
+    __m256i right = _mm256_loadu_si256(src_R);
 
-// Interleave 4-byte groups: [L0 R0 L1 R1 L2 R2 L3 R3]
-__m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
-__m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+    // Interleave 4-byte groups: [L0 R0 L1 R1 L2 R2 L3 R3]
+    __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+    __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
 
-// Apply bit reversal if needed (vectorized table lookup)
-if (needBitReversal) {
-    interleaved_lo = simd_bit_reverse(interleaved_lo);
-    interleaved_hi = simd_bit_reverse(interleaved_hi);
-}
+    // Apply bit reversal if needed (vectorized table lookup)
+    if (needBitReversal) {
+        interleaved_lo = simd_bit_reverse(interleaved_lo);
+        interleaved_hi = simd_bit_reverse(interleaved_hi);
+    }
 
-// Byte swap for little-endian targets
-if (needByteSwap) {
-    interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
-    interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+    // Byte swap for little-endian targets
+    if (needByteSwap) {
+        interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
+        interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+    }
+} else {
+    // MULTI-CHANNEL FALLBACK: Use existing scalar loop for 4/6+ channels
+    // Maintains correct channel ordering for surround DSD
+    convertDSDPlanar_Scalar(dst, src, numChannels, ...);
 }
 ```
 
@@ -340,12 +348,12 @@ __m256i simd_bit_reverse(__m256i x) {
 
 ### Files to Modify
 
-| File                  | Changes                                              |
-| --------------------- | ---------------------------------------------------- |
-| `DirettaRingBuffer.h` | Add staging buffers, SIMD conversion methods         |
-| `memcpyfast_audio.h`  | Add `memcpy_audio_fixed()` for consistent timing     |
-| `FastMemcpy_Audio.h`  | Update dispatcher, add prefetch tuning               |
-| `DirettaSync.cpp`     | Minor: ensure staging buffers used in sendAudio path |
+| File | Changes |
+|------|---------|
+| `DirettaRingBuffer.h` | Add staging buffers, SIMD conversion methods |
+| `memcpyfast_audio.h` | Add `memcpy_audio_fixed()` for consistent timing |
+| `FastMemcpy_Audio.h` | Update dispatcher, add prefetch tuning |
+| `DirettaSync.cpp` | Minor: ensure staging buffers used in sendAudio path |
 
 ### New Code Structure
 
@@ -391,12 +399,12 @@ private:
 
 ### Expected Improvements
 
-| Metric                    | Before          | After              |
-| ------------------------- | --------------- | ------------------ |
-| 24-bit packing throughput | ~3 cycles/byte  | ~0.2 cycles/byte   |
-| Timing variance (jitter)  | High (branchy)  | Low (fixed paths)  |
-| Cache efficiency          | Variable        | Predictable        |
-| Wraparound overhead       | Per-byte branch | Per-transfer check |
+| Metric | Before | After |
+|--------|--------|-------|
+| 24-bit packing throughput | ~3 cycles/byte | ~0.2 cycles/byte |
+| Timing variance (jitter) | High (branchy) | Low (fixed paths) |
+| Cache efficiency | Variable | Predictable |
+| Wraparound overhead | Per-byte branch | Per-transfer check |
 
 ---
 
@@ -425,10 +433,16 @@ private:
 A: Eliminates contention and ensures each format path has predictable cache residency.
 
 **Q: Why 64KB staging size?**
-A: Covers 340ms of 192kHz/24-bit audio, fits L2 cache, power of 2 for alignment.
+A: Covers ~57ms of 192kHz/24-bit audio (1.15MB/s), which is 40-350× larger than typical push sizes (180B-1.5KB). Fits L2 cache, power of 2 for alignment.
 
 **Q: Why overlapping stores for tail handling?**
 A: Executes same instruction count regardless of exact size, eliminating timing variance from the 256-case jump table.
 
 **Q: Why prefetch 2 iterations ahead?**
 A: Matches Zen 4 L2 latency (~12 cycles) with conversion loop timing, ensuring data arrives before needed.
+
+**Q: Why use unaligned loads (`_mm256_loadu_si256`) for input?**
+A: Input buffers from AudioEngine have no alignment guarantee. Using aligned loads would cause SIGBUS/GPF on unaligned data. On modern CPUs (Haswell+, Zen+), unaligned loads have no penalty when data is naturally aligned, so there's no performance cost.
+
+**Q: Why is DSD SIMD stereo-only?**
+A: The SIMD interleave pattern ([L0 R0 L1 R1...]) is specific to 2-channel layout. Multi-channel DSD (4/6 channels) requires different interleaving that would need per-channel-count SIMD variants. Since multi-channel DSD is rare and stereo covers 99%+ of use cases, we use scalar fallback for multi-channel to maintain correct channel ordering without over-engineering.

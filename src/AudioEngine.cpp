@@ -8,6 +8,7 @@
 #include <thread>
 #include <cstring>
 #include <algorithm>
+#include "memcpyfast_audio.h"
 
 extern "C" {
 
@@ -76,8 +77,10 @@ AudioDecoder::AudioDecoder()
     , m_audioStreamIndex(-1)
     , m_eof(false)
     , m_rawDSD(false)         // DSD mode off by default
-    , m_packet(nullptr)       // Packet for raw reading
+    , m_packet(nullptr)       // Reusable packet for raw reading
+    , m_frame(nullptr)        // Reusable frame for PCM decoding
     , m_remainingCount(0)
+    , m_resampleBufferCapacity(0)
 {
 }
 
@@ -515,7 +518,10 @@ void AudioDecoder::close() {
     if (m_codecContext) {
         avcodec_free_context(&m_codecContext);
     }
-    if (m_packet) {  // Free DSD packet
+    if (m_frame) {  // Free reusable frame
+        av_frame_free(&m_frame);
+    }
+    if (m_packet) {  // Free reusable packet
         av_packet_free(&m_packet);
     }
     if (m_formatContext) {
@@ -523,7 +529,8 @@ void AudioDecoder::close() {
     }
     m_audioStreamIndex = -1;
     m_eof = false;
-    m_rawDSD = false;  // Reset DSD flag
+    m_rawDSD = false;
+    m_resampleBufferCapacity = 0;  // Reset capacity tracking
 }
 
 size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
@@ -629,8 +636,8 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                 if (m_remainingSamples.size() < excess * 2) {
                     m_remainingSamples.resize(excess * 2);
                 }
-                memcpy(m_remainingSamples.data(), pktL + toTake, excess);
-                memcpy(m_remainingSamples.data() + excess, pktR + toTake, excess);
+                memcpy_audio(m_remainingSamples.data(), pktL + toTake, excess);
+                memcpy_audio(m_remainingSamples.data() + excess, pktR + toTake, excess);
                 m_remainingCount = excess * 2;
             }
 
@@ -642,8 +649,8 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         size_t totalBytes = actualPerCh * 2;
 
         if (actualPerCh > 0) {
-            memcpy(buffer.data(), leftData.data(), actualPerCh);
-            memcpy(buffer.data() + actualPerCh, rightData.data(), actualPerCh);
+            memcpy_audio(buffer.data(), leftData.data(), actualPerCh);
+            memcpy_audio(buffer.data() + actualPerCh, rightData.data(), actualPerCh);
         }
 
         // Debug output
@@ -721,7 +728,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
     // CRITICAL FIX: D'abord, utiliser les samples restants du buffer interne
     if (m_remainingCount > 0) {
         size_t samplesToUse = std::min(m_remainingCount, numSamples);
-        memcpy(outputPtr, m_remainingSamples.data(), samplesToUse * bytesPerSample);
+        memcpy_audio(outputPtr, m_remainingSamples.data(), samplesToUse * bytesPerSample);
         outputPtr += samplesToUse * bytesPerSample;
         totalSamplesRead += samplesToUse;
 
@@ -742,18 +749,21 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         }
     }
 
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
+    // Lazy initialization of reusable structures (allocated once, reused via unref)
+    if (!m_packet) {
+        m_packet = av_packet_alloc();
+    }
+    if (!m_frame) {
+        m_frame = av_frame_alloc();
+    }
 
-    if (!packet || !frame) {
-        if (packet) av_packet_free(&packet);
-        if (frame) av_frame_free(&frame);
+    if (!m_packet || !m_frame) {
         return totalSamplesRead; // Retourner ce qu'on a déjà lu du buffer
     }
 
     while (totalSamplesRead < numSamples && !m_eof) {
         // Read packet
-        int ret = av_read_frame(m_formatContext, packet);
+        int ret = av_read_frame(m_formatContext, m_packet);
 
         if (ret < 0) {
             // Log position when EOF occurs
@@ -786,14 +796,14 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
         }
 
         // Skip non-audio packets
-        if (packet->stream_index != m_audioStreamIndex) {
-            av_packet_unref(packet);
+        if (m_packet->stream_index != m_audioStreamIndex) {
+            av_packet_unref(m_packet);
             continue;
         }
 
         // Send packet to decoder
-        ret = avcodec_send_packet(m_codecContext, packet);
-        av_packet_unref(packet);
+        ret = avcodec_send_packet(m_codecContext, m_packet);
+        av_packet_unref(m_packet);
 
         if (ret < 0) {
             std::cerr << "[AudioDecoder] Error sending packet to decoder" << std::endl;
@@ -802,20 +812,18 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
 
         // Receive decoded frames
         while (ret >= 0 && totalSamplesRead < numSamples) {
-            ret = avcodec_receive_frame(m_codecContext, frame);
+            ret = avcodec_receive_frame(m_codecContext, m_frame);
 
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                 break;
             } else if (ret < 0) {
                 std::cerr << "[AudioDecoder] Error receiving frame from decoder" << std::endl;
-                av_frame_unref(frame);
-                av_packet_free(&packet);
-                av_frame_free(&frame);
+                av_frame_unref(m_frame);
                 return totalSamplesRead;
             }
 
             // Process frame
-            size_t frameSamples = frame->nb_samples;
+            size_t frameSamples = m_frame->nb_samples;
 
             if (m_trackInfo.isDSD) {
                 // DSD: Direct copy (no resampling!)
@@ -828,13 +836,13 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                 }
 
                 // Copy DSD data
-                if (frame->format == AV_SAMPLE_FMT_U8) {
-                    memcpy(outputPtr, frame->data[0], bytesToCopy);
-                } else if (frame->format == AV_SAMPLE_FMT_U8P) {
+                if (m_frame->format == AV_SAMPLE_FMT_U8) {
+                    memcpy_audio(outputPtr, m_frame->data[0], bytesToCopy);
+                } else if (m_frame->format == AV_SAMPLE_FMT_U8P) {
                     // Planar to interleaved
                     for (size_t i = 0; i < frameSamples; i++) {
                         for (uint32_t ch = 0; ch < m_trackInfo.channels; ch++) {
-                            *outputPtr++ = frame->data[ch][i];
+                            *outputPtr++ = m_frame->data[ch][i];
                         }
                     }
                     outputPtr -= bytesToCopy; // Reset pointer after increment
@@ -856,17 +864,22 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         AV_ROUND_UP
                     );
 
-                    // CRITICAL FIX: Allouer un buffer temporaire pour TOUS les samples convertis
+                    // Reuse member buffer with capacity growth (eliminates per-call allocation)
                     size_t tempBufferSize = totalOutSamples * bytesPerSample;
-                    AudioBuffer tempBuffer(tempBufferSize);
-                    uint8_t* tempPtr = tempBuffer.data();
+                    if (tempBufferSize > m_resampleBufferCapacity) {
+                        // Grow with 50% headroom to reduce future reallocations
+                        size_t newCapacity = static_cast<size_t>(tempBufferSize * 1.5);
+                        m_resampleBuffer.resize(newCapacity);
+                        m_resampleBufferCapacity = m_resampleBuffer.size();
+                    }
+                    uint8_t* tempPtr = m_resampleBuffer.data();
 
                     // Convertir TOUTE la frame
                     int convertedSamples = swr_convert(
                         m_swrContext,
                         &tempPtr,
                         totalOutSamples,
-                        (const uint8_t**)frame->data,
+                        (const uint8_t**)m_frame->data,
                         frameSamples
                     );
 
@@ -876,7 +889,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                         size_t bytesToUse = samplesToUse * bytesPerSample;
 
                         // Copier vers le buffer de sortie
-                        memcpy(outputPtr, tempBuffer.data(), bytesToUse);
+                        memcpy_audio(outputPtr, m_resampleBuffer.data(), bytesToUse);
                         outputPtr += bytesToUse;
                         totalSamplesRead += samplesToUse;
 
@@ -891,8 +904,8 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                             }
 
                             // Copier l'excédent
-                            memcpy(m_remainingSamples.data(),
-                                   tempBuffer.data() + bytesToUse,
+                            memcpy_audio(m_remainingSamples.data(),
+                                   m_resampleBuffer.data() + bytesToUse,
                                    excessBytes);
                             m_remainingCount = excess;
 
@@ -908,7 +921,7 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                     size_t samplesToCopy = std::min(frameSamples, samplesNeeded);
                     size_t bytesToCopy = samplesToCopy * bytesPerSample;
 
-                    memcpy(outputPtr, frame->data[0], bytesToCopy);
+                    memcpy_audio(outputPtr, m_frame->data[0], bytesToCopy);
                     outputPtr += bytesToCopy;
                     totalSamplesRead += samplesToCopy;
 
@@ -921,8 +934,8 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                             m_remainingSamples.resize(excessBytes);
                         }
 
-                        memcpy(m_remainingSamples.data(),
-                               frame->data[0] + bytesToCopy,
+                        memcpy_audio(m_remainingSamples.data(),
+                               m_frame->data[0] + bytesToCopy,
                                excessBytes);
                         m_remainingCount = excess;
 
@@ -932,12 +945,13 @@ size_t AudioDecoder::readSamples(AudioBuffer& buffer, size_t numSamples,
                 }
             }
 
-            av_frame_unref(frame);
+            av_frame_unref(m_frame);
         }
     }
 
-    av_packet_free(&packet);
-    av_frame_free(&frame);
+    // Unref for reuse (no deallocation - freed in close())
+    av_packet_unref(m_packet);
+    av_frame_unref(m_frame);
 
     return totalSamplesRead;
 }

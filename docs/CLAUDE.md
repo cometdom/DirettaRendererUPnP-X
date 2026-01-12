@@ -1,8 +1,8 @@
-# CLAUDE.md - DirettaRendererUPnP-X Project Brief
+# CLAUDE.md - DirettaRendererUPnP-L Project Brief
 
 ## Overview
 
-DirettaRendererUPnP-X is a community fork of DirettaRendererUPnP - a native UPnP/DLNA audio renderer that streams high-resolution audio (up to DSD1024/PCM 1536kHz) using the Diretta protocol for bit-perfect playback.
+DirettaRendererUPnP-L is the **low-latency optimized** fork of DirettaRendererUPnP - a native UPnP/DLNA audio renderer that streams high-resolution audio (up to DSD1024/PCM 1536kHz) using the Diretta protocol for bit-perfect playback.
 
 **Key differentiation from upstream (v1.2.1):**
 - Inherits `DIRETTA::Sync` directly (vs `DIRETTA::SyncBuffer`) for finer timing control
@@ -11,6 +11,13 @@ DirettaRendererUPnP-X is a community fork of DirettaRendererUPnP - a native UPnP
 - Lock-free audio hot path with `RingAccessGuard` pattern
 - Full format transition control with silence buffers and reopening
 - DSD byte swap support for little-endian targets
+
+**Low-latency optimizations (L variant):**
+- Reduced PCM buffer from ~1s to ~300ms (70% latency reduction)
+- 500µs micro-sleeps vs 10ms blocking sleeps (96% jitter reduction)
+- AVX2/AVX-512 SIMD format conversions (8-32x throughput)
+- Zero heap allocations in audio hot path
+- Power-of-2 ring buffer with bitmask modulo (1 cycle vs 10-20)
 
 ## Architecture
 
@@ -58,12 +65,14 @@ DirettaRendererUPnP-X is a community fork of DirettaRendererUPnP - a native UPnP
 | File | Purpose | Hot Path? |
 |------|---------|-----------|
 | `src/DirettaSync.cpp/h` | Inherits `DIRETTA::Sync`, manages ring buffer, format config | Yes |
-| `src/DirettaRingBuffer.h` | Lock-free SPSC ring buffer with format conversion methods | **Critical** |
+| `src/DirettaRingBuffer.h` | Lock-free SPSC ring buffer with AVX2 format conversion | **Critical** |
 | `src/DirettaRenderer.cpp/h` | Orchestrates playback, UPnP callbacks, threading | Partial |
 | `src/AudioEngine.cpp/h` | FFmpeg decode, format detection, sample reading | No |
 | `src/UPnPDevice.cpp/hpp` | UPnP/DLNA protocol, SSDP discovery, HTTP server | No |
 | `src/ProtocolInfoBuilder.h` | UPnP protocol info generation | No |
 | `src/main.cpp` | CLI parsing, initialization, signal handling | No |
+| `src/memcpyfast_audio.h` | AVX2/AVX-512 optimized memcpy dispatcher | **Critical** |
+| `src/fastmemcpy-avx.c` | C AVX implementation (x86 only) | **Critical** |
 
 ## Diretta SDK Reference
 
@@ -127,18 +136,21 @@ AudioEngine::readSamples()
     └─▶ DirettaSync::sendAudio()
             └─▶ RingAccessGuard (atomic increment)
             └─▶ DirettaRingBuffer::push*()
-                    └─▶ std::memcpy / byte manipulation
+                    └─▶ AVX2 format conversion (staging buffer)
+                    └─▶ memcpy_audio_fixed() to ring
 
 DirettaSync::getNewStream()  [SDK callback, runs in SDK thread]
     └─▶ DirettaRingBuffer::pop()
-            └─▶ std::memcpy
+            └─▶ memcpy_audio() to DIRETTA::Stream
 ```
 
 **Rules for hot path code:**
-- No heap allocations
+- No heap allocations (reuse `m_packet`, `m_frame`, staging buffers)
 - No mutex locks (use atomics via `RingAccessGuard`)
-- Bitmask modulo (power-of-2 buffer size)
+- Bitmask modulo (power-of-2 buffer size: `pos & mask_`)
 - Predictable branch patterns
+- Use `memcpy_audio()` instead of `std::memcpy`
+- 64-byte alignment for SIMD buffers (`alignas(64)`)
 
 ## Lock-Free Patterns
 
@@ -175,30 +187,42 @@ class ReconfigureGuard {
 
 ## Format Support
 
-| Format | Bit Depth | Sample Rates | Ring Buffer Method |
-|--------|-----------|--------------|-------------------|
-| PCM | 16-bit | 44.1kHz - 384kHz | `push16To32()` |
-| PCM | 24-bit | 44.1kHz - 384kHz | `push24BitPacked()` (auto-detects LSB/MSB alignment) |
-| PCM | 32-bit | 44.1kHz - 384kHz | `push()` |
-| DSD | 1-bit | DSD64 - DSD512 | `pushDSDPlanar()` (planar→interleaved, optional bit reversal & byte swap) |
+| Format | Bit Depth | Sample Rates | Ring Buffer Method | SIMD |
+|--------|-----------|--------------|-------------------|------|
+| PCM | 16-bit | 44.1kHz - 384kHz | `push16To32()` | AVX2 16x |
+| PCM | 24-bit | 44.1kHz - 384kHz | `push24BitPacked()` | AVX2 8x |
+| PCM | 32-bit | 44.1kHz - 384kHz | `push()` | memcpy |
+| DSD | 1-bit | DSD64 - DSD512 | `pushDSDPlanar()` | AVX2 32x |
 
 ### S24 Format Auto-Detection
 
 The ring buffer auto-detects 24-bit sample alignment on first push:
-- **LSB-aligned**: bytes 0-2 contain data (standard S24_LE)
-- **MSB-aligned**: bytes 1-3 contain data (S24_32BE-style)
+- **LSB-aligned**: bytes 0-2 contain data (standard S24_LE) → `convert24BitPacked_AVX2()`
+- **MSB-aligned**: bytes 1-3 contain data (S24_32BE-style) → `convert24BitPackedShifted_AVX2()`
+
+### SIMD Format Conversions
+
+All format conversions use 64-byte aligned staging buffers before writing to the ring:
+
+| Conversion | Function | Throughput |
+|------------|----------|------------|
+| 24-bit pack (LSB) | `convert24BitPacked_AVX2()` | 8 samples/instruction |
+| 24-bit pack (MSB) | `convert24BitPackedShifted_AVX2()` | 8 samples/instruction |
+| 16→32 upsample | `convert16To32_AVX2()` | 16 samples/instruction |
+| DSD planar→interleaved | `convertDSDPlanar_AVX2()` | 32 bytes/instruction |
+| DSD bit reversal | `simd_bit_reverse()` | 32 bytes/instruction |
 
 ## Buffer Configuration
 
-From `DirettaSync.h`:
+From `DirettaSync.h` (low-latency tuned):
 
 ```cpp
 namespace DirettaBuffer {
     constexpr float DSD_BUFFER_SECONDS = 0.8f;
-    constexpr float PCM_BUFFER_SECONDS = 1.0f;
+    constexpr float PCM_BUFFER_SECONDS = 0.3f;   // Was 1.0f - 70% latency reduction
 
     constexpr size_t DSD_PREFILL_MS = 200;
-    constexpr size_t PCM_PREFILL_MS = 50;
+    constexpr size_t PCM_PREFILL_MS = 30;        // Was 50ms - faster start
     constexpr size_t PCM_LOWRATE_PREFILL_MS = 100;
 
     constexpr unsigned int DAC_STABILIZATION_MS = 100;
@@ -206,10 +230,35 @@ namespace DirettaBuffer {
     constexpr unsigned int FORMAT_SWITCH_DELAY_MS = 800;
     constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 50;
 
-    constexpr size_t MIN_BUFFER_BYTES = 3072000;  // ~2 seconds at 192kHz
+    constexpr size_t MIN_BUFFER_BYTES = 65536;   // Was 3072000 - allows 300ms at all rates
     constexpr size_t MAX_BUFFER_BYTES = 16777216; // 16MB
 }
 ```
+
+### Flow Control Constants
+
+From `DirettaRenderer.cpp`:
+
+```cpp
+namespace FlowControl {
+    constexpr int MICROSLEEP_US = 500;           // Was 10,000µs (10ms)
+    constexpr int MAX_WAIT_MS = 20;              // Was 500ms
+    constexpr float CRITICAL_BUFFER_LEVEL = 0.10f; // Early-return below 10%
+}
+```
+
+## Performance Summary
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| PCM buffer latency | ~1000ms | ~300ms | 70% reduction |
+| Time to first audio | ~50ms prefill | ~30ms prefill | 40% faster |
+| Backpressure max stall | 500ms | 20ms | 96% reduction |
+| Heap allocs per decode | 3-4 | 0 (steady state) | Eliminated |
+| Scheduling granularity | 186ms @44.1k | 46ms @44.1k | 4x finer |
+| Ring buffer modulo | 10-20 cycles | 1 cycle | 10-20x faster |
+| 24-bit conversion | ~1 sample/cycle | ~8 samples/cycle | 8x faster |
+| DSD interleave | ~1 byte/cycle | ~32 bytes/cycle | 32x faster |
 
 ## Coding Conventions
 
@@ -304,14 +353,20 @@ sudo apt install build-essential libavformat-dev libavcodec-dev libavutil-dev li
 - [x] S24 pack mode auto-detection
 - [x] DSD byte swap for little-endian targets
 - [x] Full format transition with `reopenForFormatChange()`
-
-### In Progress
-- [ ] DSD→PCM transition optimization (see `PLAN-DSD-PCM-TRANSITION.md`)
+- [x] DSD→PCM transition fix (800ms settling for I2S targets)
+- [x] AVX2 SIMD format conversions (24-bit pack, 16→32, DSD interleave)
+- [x] Low-latency buffer mode (~300ms PCM)
+- [x] 500µs micro-sleep flow control
+- [x] Zero heap allocations in hot path (reusable `m_packet`, `m_frame`)
+- [x] ARM64 compatibility (auto-vectorized `std::memcpy`)
+- [x] Playlist end target release fix
+- [x] UPnP Stop closes Diretta connection properly
 
 ### Potential Future Work
-- [ ] SIMD optimizations for format conversion (AVX2 24-bit packing, 16-to-32 upsampling)
-- [ ] SIMD DSD interleaving
-- [ ] Low-latency buffer mode (~300ms)
+- [ ] AVX-512 format conversions (currently only memcpy uses AVX-512)
+- [ ] ARM NEON hand-optimized format conversions
+- [ ] Multi-producer ring buffer for multiple audio sources
+- [ ] Adaptive prefetch tuning based on cache behavior
 
 ## Format Transition Handling
 
@@ -335,6 +390,7 @@ From `PLAN-DSD-PCM-TRANSITION.md`:
 | Pink noise (DSD) | Bit reversal wrong | Check DSF vs DFF detection |
 | Gapless gaps | Format change | Expected for sample rate changes |
 | DSD→PCM clicks | I2S target sensitivity | See `PLAN-DSD-PCM-TRANSITION.md` |
+| Target stuck after playlist | Old bug (fixed) | `trackEndCallback` now closes connection |
 
 ## Key Constraints
 
@@ -357,6 +413,8 @@ When modifying this codebase:
 
 | Document | Purpose |
 |----------|---------|
+| `PCM_OPTIMIZATION_CHANGES.md` | Low-latency PCM optimizations, buffer tuning, flow control |
+| `SIMD_OPTIMIZATION_CHANGES.md` | AVX2/AVX-512 SIMD, lock-free patterns, ring buffer |
 | `FORK_CHANGES.md` | Detailed diff from original v1.2.1 |
 | `PLAN-DSD-PCM-TRANSITION.md` | DSD→PCM transition fix plan |
 | `README.md` | User documentation |

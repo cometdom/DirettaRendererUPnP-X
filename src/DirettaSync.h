@@ -75,10 +75,10 @@ struct AudioFormat {
 
 namespace DirettaBuffer {
     constexpr float DSD_BUFFER_SECONDS = 0.8f;
-    constexpr float PCM_BUFFER_SECONDS = 1.0f;
+    constexpr float PCM_BUFFER_SECONDS = 0.3f;  // Was 1.0f - low latency
 
     constexpr size_t DSD_PREFILL_MS = 200;
-    constexpr size_t PCM_PREFILL_MS = 50;
+    constexpr size_t PCM_PREFILL_MS = 30;       // Was 50 - faster start
     constexpr size_t PCM_LOWRATE_PREFILL_MS = 100;
 
     constexpr unsigned int DAC_STABILIZATION_MS = 100;
@@ -87,7 +87,8 @@ namespace DirettaBuffer {
     constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 50;
 
     // UPnP push model needs larger buffers than MPD's pull model
-    constexpr size_t MIN_BUFFER_BYTES = 3072000;  // ~2 seconds at 192kHz
+    // 64KB = ~370ms floor at 44.1kHz/16-bit, negligible at higher rates
+    constexpr size_t MIN_BUFFER_BYTES = 65536;  // Was 3072000
     constexpr size_t MAX_BUFFER_BYTES = 16777216;
     constexpr size_t MIN_PREFILL_BYTES = 1024;
 
@@ -268,7 +269,6 @@ private:
     bool waitForOnline(unsigned int timeoutMs);
     void logSinkCapabilities();
 
-    // RAII guard for safe reconfiguration
     class ReconfigureGuard {
     public:
         explicit ReconfigureGuard(DirettaSync& sync) : sync_(sync) { sync_.beginReconfigure(); }
@@ -318,7 +318,7 @@ private:
     // Ring buffer
     DirettaRingBuffer m_ringBuffer;
 
-    // Format parameters (atomic for lock-free reading)
+    // Format parameters (atomic snapshot for audio thread)
     std::atomic<int> m_sampleRate{44100};
     std::atomic<int> m_channels{2};
     std::atomic<int> m_bytesPerSample{2};

@@ -1375,18 +1375,18 @@ git commit -m "chore: audio memory optimization complete"
 
 ## Summary
 
-| Task  | Component             | Key Files                                    |
-| ----- | --------------------- | -------------------------------------------- |
-| 1     | Test harness          | `AudioMemoryTest.h`, `test_audio_memory.cpp` |
-| 2     | memcpy_audio_fixed    | `memcpyfast_audio.h`                         |
-| 3     | Staging buffers       | `DirettaRingBuffer.h`                        |
-| 4     | writeToRing helper    | `DirettaRingBuffer.h`                        |
-| 5     | 24-bit SIMD packing   | `DirettaRingBuffer.h`                        |
-| 6     | 16→32 SIMD upsampling | `DirettaRingBuffer.h`                        |
-| 7     | DSD stereo SIMD       | `DirettaRingBuffer.h`                        |
-| 8     | Prefetch tuning       | `memcpyfast_audio.h`                         |
-| 9-11  | Integration           | `DirettaRingBuffer.h`                        |
-| 12-13 | Testing               | `test_audio_memory.cpp`                      |
+| Task | Component | Key Files |
+|------|-----------|-----------|
+| 1 | Test harness | `AudioMemoryTest.h`, `test_audio_memory.cpp` |
+| 2 | memcpy_audio_fixed | `memcpyfast_audio.h` |
+| 3 | Staging buffers | `DirettaRingBuffer.h` |
+| 4 | writeToRing helper | `DirettaRingBuffer.h` |
+| 5 | 24-bit SIMD packing | `DirettaRingBuffer.h` |
+| 6 | 16→32 SIMD upsampling | `DirettaRingBuffer.h` |
+| 7 | DSD stereo SIMD | `DirettaRingBuffer.h` |
+| 8 | Prefetch tuning | `memcpyfast_audio.h` |
+| 9-11 | Integration | `DirettaRingBuffer.h` |
+| 12-13 | Testing | `test_audio_memory.cpp` |
 
 **Total estimated steps:** 52 steps across 13 tasks
 **Commit frequency:** Every task (13 commits)
