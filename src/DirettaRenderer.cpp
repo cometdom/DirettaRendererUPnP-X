@@ -21,6 +21,17 @@ extern bool g_verbose;
 #define DEBUG_LOG(x) if (g_verbose) { std::cout << x << std::endl; }
 
 //=============================================================================
+// Hybrid Flow Control Constants
+//=============================================================================
+
+namespace FlowControl {
+    constexpr int MICROSLEEP_US = 500;                                    // 500µs micro-sleep (was 10ms)
+    constexpr int MAX_WAIT_MS = 20;                                       // Max total wait time
+    constexpr int MAX_RETRIES = MAX_WAIT_MS * 1000 / MICROSLEEP_US;       // 40 retries
+    constexpr float CRITICAL_BUFFER_LEVEL = 0.10f;                        // Early-return below 10%
+}
+
+//=============================================================================
 // UUID Generation
 //=============================================================================
 
@@ -169,9 +180,22 @@ bool DirettaRenderer::start() {
 
                 if (trackInfo.isDSD) {
                     format.bitDepth = 1;
-                    format.dsdFormat = (trackInfo.codec.find("lsb") != std::string::npos)
-                        ? AudioFormat::DSDFormat::DSF
-                        : AudioFormat::DSDFormat::DFF;
+                    // Use detected source format (from file extension or codec)
+                    if (trackInfo.dsdSourceFormat == TrackInfo::DSDSourceFormat::DSF) {
+                        format.dsdFormat = AudioFormat::DSDFormat::DSF;
+                        DEBUG_LOG("[Callback] DSD format: DSF (LSB first)");
+                    } else if (trackInfo.dsdSourceFormat == TrackInfo::DSDSourceFormat::DFF) {
+                        format.dsdFormat = AudioFormat::DSDFormat::DFF;
+                        DEBUG_LOG("[Callback] DSD format: DFF (MSB first)");
+                    } else {
+                        // Fallback to codec string if detection failed
+                        format.dsdFormat = (trackInfo.codec.find("lsb") != std::string::npos)
+                            ? AudioFormat::DSDFormat::DSF
+                            : AudioFormat::DSDFormat::DFF;
+                        DEBUG_LOG("[Callback] DSD format: "
+                                  << (format.dsdFormat == AudioFormat::DSDFormat::DSF ? "DSF" : "DFF")
+                                  << " (from codec fallback)");
+                    }
                 }
 
                 // Open/resume connection if needed
@@ -232,16 +256,19 @@ bool DirettaRenderer::start() {
                         std::cerr << "[Callback] DSD timeout" << std::endl;
                     }
                 } else {
-                    // PCM: Incremental send
+                    // PCM: Incremental send with hybrid flow control
                     const uint8_t* audioData = buffer.data();
                     size_t remainingSamples = samples;
                     size_t bytesPerSample = (bitDepth == 24 || bitDepth == 32)
                         ? 4 * channels : (bitDepth / 8) * channels;
 
-                    int retryCount = 0;
-                    const int maxRetries = 50;
+                    // Hybrid flow control: micro-sleep normally, early-return if buffer critical
+                    float bufferLevel = m_direttaSync->getBufferLevel();
+                    bool criticalMode = (bufferLevel < FlowControl::CRITICAL_BUFFER_LEVEL);
 
-                    while (remainingSamples > 0 && retryCount < maxRetries) {
+                    int retryCount = 0;
+
+                    while (remainingSamples > 0 && retryCount < FlowControl::MAX_RETRIES) {
                         size_t sent = m_direttaSync->sendAudio(audioData, remainingSamples);
 
                         if (sent > 0) {
@@ -250,7 +277,13 @@ bool DirettaRenderer::start() {
                             audioData += sent;
                             retryCount = 0;
                         } else {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            if (criticalMode) {
+                                // Buffer critically low - return immediately to prioritize refill
+                                DEBUG_LOG("[Audio] Early-return, buffer critical: " << bufferLevel);
+                                break;
+                            }
+                            // Normal backpressure: 500µs micro-sleep (was 10ms)
+                            std::this_thread::sleep_for(std::chrono::microseconds(FlowControl::MICROSLEEP_US));
                             retryCount++;
                         }
                     }
@@ -284,13 +317,20 @@ bool DirettaRenderer::start() {
         );
 
         m_audioEngine->setTrackEndCallback([this]() {
-            std::cout << "[DirettaRenderer] 🏁 Track ended naturally" << std::endl;
+            std::cout << "[DirettaRenderer] Track ended naturally" << std::endl;
+
+            // Fully release the Diretta target on playlist end
+            // This closes the SDK connection so the target can accept other sources
+            // Using release() instead of close() ensures complete disconnection
+            if (m_direttaSync) {
+                m_direttaSync->release();
+            }
+
             // Notify control point that track finished
             // This is required for sequential playlist advancement
             // The control point will poll GetTransportInfo, see STOPPED,
             // and send SetAVTransportURI + Play for the next track
             m_upnp->notifyStateChange("STOPPED");
-            std::cout << "[DirettaRenderer] 🏁 Notified STOPPED to control point" << std::endl;
         });
 
         //=====================================================================
@@ -403,13 +443,14 @@ bool DirettaRenderer::start() {
                 m_audioEngine->setCurrentURI(m_currentURI, m_currentMetadata, true);
             }
 
-            // Don't close DirettaSync here - keep connection alive for quick track transitions
-            // DirettaSync will only close on:
-            // - Format family change (PCM↔DSD) - handled in audio callback
-            // - App shutdown - handled in DirettaRenderer::stop()
+            // Fully release Diretta target on Stop for proper resource cleanup
+            // This ensures:
+            // - Clean handoff when switching to a different renderer
+            // - Proper resource release on the Diretta target
+            // - Control point gets expected clean disconnection
+            // Trade-off: subsequent Play will need to reopen SDK (~300ms)
             if (m_direttaSync) {
-                m_direttaSync->stopPlayback(true);
-                // m_direttaSync->close();  // Removed - keep connection open
+                m_direttaSync->release();
             }
 
             m_upnp->notifyStateChange("STOPPED");
@@ -524,7 +565,14 @@ void DirettaRenderer::audioThreadFunc() {
             }
 
             // Adjust samples per call based on format
-            size_t samplesPerCall = isDSD ? 32768 : 8192;
+            // PCM: 2048 samples = ~46ms at 44.1kHz
+            // DSD: Rate-adaptive for consistent ~12ms chunks
+            size_t samplesPerCall;
+            if (isDSD) {
+                samplesPerCall = DirettaBuffer::calculateDsdSamplesPerCall(sampleRate);
+            } else {
+                samplesPerCall = 2048;
+            }
 
             if (sampleRate != lastSampleRate || samplesPerCall != currentSamplesPerCall) {
                 currentSamplesPerCall = samplesPerCall;

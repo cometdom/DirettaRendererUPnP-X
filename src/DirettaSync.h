@@ -75,10 +75,10 @@ struct AudioFormat {
 
 namespace DirettaBuffer {
     constexpr float DSD_BUFFER_SECONDS = 0.8f;
-    constexpr float PCM_BUFFER_SECONDS = 1.0f;
+    constexpr float PCM_BUFFER_SECONDS = 0.3f;  // Was 1.0f - low latency
 
     constexpr size_t DSD_PREFILL_MS = 200;
-    constexpr size_t PCM_PREFILL_MS = 50;
+    constexpr size_t PCM_PREFILL_MS = 30;       // Was 50 - faster start
     constexpr size_t PCM_LOWRATE_PREFILL_MS = 100;
 
     constexpr unsigned int DAC_STABILIZATION_MS = 100;
@@ -87,7 +87,8 @@ namespace DirettaBuffer {
     constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 100;
 
     // UPnP push model needs larger buffers than MPD's pull model
-    constexpr size_t MIN_BUFFER_BYTES = 3072000;  // ~2 seconds at 192kHz
+    // 64KB = ~370ms floor at 44.1kHz/16-bit, negligible at higher rates
+    constexpr size_t MIN_BUFFER_BYTES = 65536;  // Was 3072000
     constexpr size_t MAX_BUFFER_BYTES = 16777216;
     constexpr size_t MIN_PREFILL_BYTES = 1024;
 
@@ -103,6 +104,31 @@ namespace DirettaBuffer {
                            isLowBitrate ? PCM_LOWRATE_PREFILL_MS : PCM_PREFILL_MS;
         size_t result = (bytesPerSecond * prefillMs) / 1000;
         return std::max(result, MIN_PREFILL_BYTES);
+    }
+
+    // Calculate DSD samples per call based on rate
+    // Target: ~10-12ms chunks for consistent scheduling granularity
+    // Returns DSD samples (1-bit), which convert to bytes via: bytes = samples * channels / 8
+    inline size_t calculateDsdSamplesPerCall(uint32_t dsdSampleRate) {
+        // Target chunk duration in milliseconds
+        constexpr double TARGET_CHUNK_MS = 12.0;
+
+        // Limits
+        constexpr size_t MIN_DSD_SAMPLES = 8192;   // ~3ms at DSD64
+        constexpr size_t MAX_DSD_SAMPLES = 131072; // ~46ms at DSD64, ~3ms at DSD1024
+
+        // Calculate samples for target duration
+        // DSD sample rate is the 1-bit rate (e.g., 2822400 for DSD64)
+        size_t samplesPerCall = static_cast<size_t>(dsdSampleRate * TARGET_CHUNK_MS / 1000.0);
+
+        // Round to multiple of 256 for alignment (32 bytes per channel minimum)
+        samplesPerCall = ((samplesPerCall + 255) / 256) * 256;
+
+        // Clamp to reasonable range (match existing std::max/std::min pattern)
+        samplesPerCall = std::max(samplesPerCall, MIN_DSD_SAMPLES);
+        samplesPerCall = std::min(samplesPerCall, MAX_DSD_SAMPLES);
+
+        return samplesPerCall;
     }
 }
 
@@ -190,9 +216,18 @@ public:
     bool open(const AudioFormat& format);
 
     /**
-     * @brief Close connection
+     * @brief Close connection (keeps SDK ready for quick resume)
      */
     void close();
+
+    /**
+     * @brief Release target completely (closes SDK connection)
+     *
+     * Use this when playback has ended and we want to fully release
+     * the target so it can accept connections from other sources.
+     * The next open() will automatically reopen the SDK.
+     */
+    void release();
 
     bool isOpen() const { return m_open; }
     bool isOnline() { return is_online(); }
@@ -259,12 +294,25 @@ private:
     void configureSinkDSD(uint32_t dsdBitRate, int channels, const AudioFormat& format);
     void configureRingPCM(int rate, int channels, int direttaBps, int inputBps);
     void configureRingDSD(uint32_t byteRate, int channels);
+    void beginReconfigure();
+    void endReconfigure();
 
     void applyTransferMode(DirettaTransferMode mode, ACQUA::Clock cycleTime);
     unsigned int calculateCycleTime(uint32_t sampleRate, int channels, int bitsPerSample);
     void requestShutdownSilence(int buffers);
     bool waitForOnline(unsigned int timeoutMs);
     void logSinkCapabilities();
+
+    class ReconfigureGuard {
+    public:
+        explicit ReconfigureGuard(DirettaSync& sync) : sync_(sync) { sync_.beginReconfigure(); }
+        ~ReconfigureGuard() { sync_.endReconfigure(); }
+        ReconfigureGuard(const ReconfigureGuard&) = delete;
+        ReconfigureGuard& operator=(const ReconfigureGuard&) = delete;
+
+    private:
+        DirettaSync& sync_;
+    };
 
     //=========================================================================
     // State
@@ -280,8 +328,9 @@ private:
     uint32_t m_effectiveMTU = 1500;
 
     // Connection state
-    std::atomic<bool> m_enabled{false};
-    std::atomic<bool> m_open{false};
+    std::atomic<bool> m_enabled{false};      // Target discovered, ready to use
+    std::atomic<bool> m_sdkOpen{false};      // SDK-level connection open
+    std::atomic<bool> m_open{false};         // Connected to target for playback
     std::atomic<bool> m_playing{false};
     std::atomic<bool> m_paused{false};
 
@@ -298,23 +347,24 @@ private:
     std::thread m_workerThread;
     std::mutex m_workerMutex;
     std::mutex m_configMutex;
-    std::mutex m_pushMutex;
+    std::atomic<bool> m_reconfiguring{false};
+    mutable std::atomic<int> m_ringUsers{0};
 
     // Ring buffer
     DirettaRingBuffer m_ringBuffer;
 
-    // Format parameters (protected by m_configMutex)
-    int m_sampleRate = 44100;
-    int m_channels = 2;
-    int m_bytesPerSample = 2;
-    int m_inputBytesPerSample = 2;
-    int m_bytesPerBuffer = 176;
-    bool m_need24BitPack = false;
-    bool m_need16To32Upsample = false;
-    bool m_isDsdMode = false;
-    bool m_needDsdBitReversal = false;
-    bool m_needDsdByteSwap = false;  // For LITTLE endian targets
-    bool m_isLowBitrate = false;
+    // Format parameters (atomic snapshot for audio thread)
+    std::atomic<int> m_sampleRate{44100};
+    std::atomic<int> m_channels{2};
+    std::atomic<int> m_bytesPerSample{2};
+    std::atomic<int> m_inputBytesPerSample{2};
+    std::atomic<int> m_bytesPerBuffer{176};
+    std::atomic<bool> m_need24BitPack{false};
+    std::atomic<bool> m_need16To32Upsample{false};
+    std::atomic<bool> m_isDsdMode{false};
+    std::atomic<bool> m_needDsdBitReversal{false};
+    std::atomic<bool> m_needDsdByteSwap{false};  // For LITTLE endian targets
+    std::atomic<bool> m_isLowBitrate{false};
 
     // Prefill and stabilization
     size_t m_prefillTarget = 0;

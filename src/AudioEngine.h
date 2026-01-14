@@ -30,7 +30,13 @@ struct TrackInfo {
     int dsdRate;       // DSD rate (64, 128, 256, 512, 1024)
     bool isCompressed; // true if format requires decoding (FLAC/ALAC), false for WAV/AIFF
 
-    TrackInfo() : sampleRate(0), bitDepth(0), channels(2), duration(0), isDSD(false), dsdRate(0), isCompressed(true) {}
+    // DSD source format detection (for correct bit ordering)
+    enum class DSDSourceFormat { Unknown, DSF, DFF };
+    DSDSourceFormat dsdSourceFormat;
+
+    TrackInfo() : sampleRate(0), bitDepth(0), channels(2), duration(0),
+                  isDSD(false), dsdRate(0), isCompressed(true),
+                  dsdSourceFormat(DSDSourceFormat::Unknown) {}
 };
 
 /**
@@ -40,6 +46,14 @@ class AudioBuffer {
 public:
     AudioBuffer(size_t size = 0);
     ~AudioBuffer();
+
+    // Prevent copying (would cause double-delete of m_data)
+    AudioBuffer(const AudioBuffer&) = delete;
+    AudioBuffer& operator=(const AudioBuffer&) = delete;
+
+    // Allow moving
+    AudioBuffer(AudioBuffer&& other) noexcept;
+    AudioBuffer& operator=(AudioBuffer&& other) noexcept;
 
     void resize(size_t size);
     size_t size() const { return m_size; }
@@ -111,13 +125,23 @@ private:
 
     // DSD Native Mode
     bool m_rawDSD;           // True if reading raw DSD packets (no decoding)
-    AVPacket* m_packet;      // For raw packet reading
+    AVPacket* m_packet;      // Reusable for raw packet reading (DSD and PCM)
+    AVFrame* m_frame;        // Reusable for decoded frames (PCM) - eliminates per-call alloc
 
     // CRITICAL: Buffer interne pour les samples excédentaires
     // Quand une frame décodée contient plus de samples que demandé,
     // on garde l'excédent ici pour le prochain appel
     AudioBuffer m_remainingSamples;
     size_t m_remainingCount;
+
+    // Reusable resample buffer (eliminates per-call allocation)
+    AudioBuffer m_resampleBuffer;
+    size_t m_resampleBufferCapacity = 0;
+
+    // Pre-allocated DSD channel buffers (eliminates per-call std::vector allocation)
+    AudioBuffer m_dsdLeftBuffer;
+    AudioBuffer m_dsdRightBuffer;
+    size_t m_dsdBufferCapacity = 0;
 
     // Debug/diagnostic counters (instance variables, NOT static!)
     // These were previously static variables causing race conditions when

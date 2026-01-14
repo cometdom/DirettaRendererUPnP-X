@@ -1,454 +1,175 @@
 # Changelog
 
-All notable changes to DirettaRendererUPnP will be documented in this file.
+## 2026-01-14
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+### 1. DSD Buffer Optimization - Pre-allocated Buffers
 
+- Eliminated per-call heap allocations in DSD hot path
+- Replaced `std::vector<uint8_t>` with pre-allocated `AudioBuffer` members
+- Added `m_dsdLeftBuffer`, `m_dsdRightBuffer`, `m_dsdBufferCapacity` to `AudioDecoder`
+- All `.insert()` operations replaced with `memcpy()` + offset tracking
+- Buffers only resize when capacity is insufficient (rare, typically once per session)
+- **Files:** `src/AudioEngine.h` (lines 141-144), `src/AudioEngine.cpp` (lines 552-661, 534)
 
-# Changelog - Version 1.1.2
+### 2. DSD Rate-Adaptive Chunk Sizing
 
-## [1.1.2] - 2025-12-30
+- Added `DirettaBuffer::calculateDsdSamplesPerCall()` function
+- DSD chunks now scale with sample rate to maintain ~12ms granularity
+- Previously fixed at 32768 samples regardless of DSD rate
+- Significantly reduces loop iterations for high-rate DSD (DSD256+)
+- **Files:** `src/DirettaSync.h` (lines 109-132), `src/DirettaRenderer.cpp` (lines 567-575)
 
-### Fixed
-Some bugs fixes
+### Performance Impact
 
-DSD files playback after a delay of 1 nminute 40.
+| DSD Rate | Before (fixed 32768) | After (rate-adaptive) | Improvement |
+|----------|----------------------|-----------------------|-------------|
+| DSD64    | ~11.6ms/chunk        | ~12.1ms/chunk         | Similar |
+| DSD128   | ~5.8ms/chunk         | ~12.0ms/chunk         | 2x fewer iterations |
+| DSD256   | ~2.9ms/chunk         | ~11.6ms/chunk         | 4x fewer iterations |
+| DSD512   | ~1.45ms/chunk        | ~5.8ms/chunk          | 4x fewer iterations |
+| DSD1024  | ~0.7ms/chunk         | ~2.9ms/chunk          | 4x fewer iterations |
 
-**Simplified structure - mutex held throughout callback:**
-
-## [1.1.1] - 2025-12-25
-
-### Fixed
-
-#### **CRITICAL: Deadlock causing no audio output on slower systems (RPi4, etc.)**
-- **Issue**: Renderer would freeze after "Waiting for DAC stabilization" message, no audio output
-- **Affected systems**: Primarily Raspberry Pi 4 and other ARM-based systems, occasional issues on slower x86 systems
-- **Root cause**: Mutex (`m_mutex`) held during `waitForCallbackComplete()` in `onSetURI` callback
-  - Added in v1.0.8 for JPlay iOS compatibility (Auto-STOP feature)
-  - On slow CPUs (RPi4), the audio callback thread would attempt to acquire the same mutex
-  - Result: Deadlock - each thread waiting for the other
-- **Solution**: Release `m_mutex` before calling `waitForCallbackComplete()`
-  - Lock mutex → Read state → Unlock
-  - Perform Auto-STOP without mutex held
-  - Re-lock mutex → Update URI → Unlock
-- **Impact**: Fixes freeze on all systems, maintains JPlay iOS compatibility
-- **Technical details**:
-  ```cpp
-  // BEFORE (v1.1.0 - DEADLOCK):
-  std::lock_guard<std::mutex> lock(m_mutex);  // Held entire time
-  auto currentState = m_audioEngine->getState();
-  // ... Auto-STOP ...
-  waitForCallbackComplete();  // DEADLOCK: waiting while mutex locked
-  
-  // AFTER (v1.1.1 - FIXED):
-  {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      currentState = m_audioEngine->getState();
-  }  // Mutex released here
-  // ... Auto-STOP ...
-  waitForCallbackComplete();  // SAFE: no mutex held
-  ```
-
-#### **Multi-interface support not working**
-- **Issue**: `--interface` option parsed but ignored, UPnP always bound to default interface
-- **Symptom**: 
-  ```
-  ✓ Will bind to interface: enp1s0u1u1  ← Recognized
-  🌐 Using default interface for UPnP (auto-detect)  ← Ignored!
-  ✓ UPnP initialized on 172.20.0.1:4005  ← Wrong interface
-  ```
-- **Root cause**: `networkInterface` parameter not passed from `DirettaRenderer::Config` to `UPnPDevice::Config`
-- **Solution**: Added missing parameter propagation in `DirettaRenderer.cpp`:
-  ```cpp
-  upnpConfig.networkInterface = m_config.networkInterface;
-  ```
-- **Impact**: Multi-interface support now works correctly for 3-tier architectures
-
-#### **Raspberry Pi variant detection (Makefile)**
-- **Issue**: RPi3/4 incorrectly detected as k16 variant (16KB pages), causing link errors
-- **Symptom**:
-  ```
-  Architecture:  ARM64 (aarch64) - Kernel 6.12 (using k16 variant)  ← WRONG for RPi4
-  Variant:       aarch64-linux-15k16  ← RPi4 doesn't support k16
-  ```
-- **Root cause**: Detection based on kernel version (>= 4.16) instead of actual page size
-  - RPi3/4: 4KB pages, need `aarch64-linux-15`
-  - RPi5: 16KB pages, need `aarch64-linux-15k16`
-  - Kernel 6.12 on RPi4 triggered wrong detection
-- **Solution**: Use `getconf PAGESIZE` and `/proc/device-tree/model` for accurate detection
-  ```makefile
-  PAGE_SIZE := $(shell getconf PAGESIZE)
-  IS_RPI5 := $(shell grep -q "Raspberry Pi 5" /proc/device-tree/model)
-  
-  # Use k16 only if explicitly RPi5 or 16KB pages detected
-  ```
-- **Impact**: Correct library selection on all Raspberry Pi models
-
-### Changed
-- Improved mutex handling in UPnP callbacks for better thread safety
-- Enhanced Makefile architecture detection logic for ARM systems
-
-### Technical Notes
-
-#### Deadlock Debug Information
-The deadlock manifested differently based on system performance:
-- **Fast x86 systems**: Rare or no issues (callback completes before conflict)
-- **Slow ARM systems (RPi4)**: Consistent freeze (timing window for deadlock much larger)
-- **Trigger**: User changing tracks/albums while audio playing
-- **Timing window**: 400ms sleep in callback provided ample opportunity for deadlock on slow systems
-
-#### Multi-Interface Fix
-Affects users with:
-- 3-tier architecture (control points on one network, DAC on another)
-- VPN + local network configurations
-- Multiple Ethernet adapters
-- Any scenario requiring explicit interface binding
-
-Without this fix, the `--interface` parameter was completely ignored, making 3-tier setups impossible.
-
-#### Raspberry Pi Detection
-Previous kernel-based detection failed because:
-- Kernel version indicates OS capability, not hardware configuration
-- RPi4 can run kernel 6.12+ but hardware still uses 4KB pages
-- RPi5 introduced 16KB pages and requires different SDK library variant
-- Using wrong variant causes immediate segfault on startup
-
-### Compatibility
-- ✅ Backward compatible with v1.1.0 configurations
-- ✅ No changes to command-line options
-- ✅ No changes to systemd configuration files
-- ✅ All v1.1.0 features preserved (multi-interface, format change fix)
-
-### Tested Configurations
-- ✅ Raspberry Pi 3 (aarch64-linux-15)
-- ✅ Raspberry Pi 4 (aarch64-linux-15)
-- ✅ Raspberry Pi 5 (aarch64-linux-15k16)
-- ✅ x86_64 systems (all variants: v2, v3, v4, zen4)
-- ✅ GentooPlayer distribution
-- ✅ AudioLinux distribution
-- ✅ 3-tier network architectures
-- ✅ JPlay iOS (Auto-STOP functionality)
-
-### Migration from v1.1.0
-
-No special migration steps required. Simply:
-
-```bash
-cd DirettarendererUPnP
-# Pull latest code
-git pull
-
-# Rebuild
-make clean
-make
-
-sudo systemctl stop diretta-renderer
-
-# Reinstall (if using systemd)
-cd Systemd
-chmod +x install-systemd.sh
-sudo ./install-systemd.sh
-
-# Restart service
-sudo systemctl restart diretta-renderer
-```
-
-### Known Issues
-None
-
-### Credits
-- Deadlock issue reported and tested by RPi4 users (Alfred and Nico)
-- Multi-interface issue reported by dsnyder (3-tier architecture pioneer) and kiran kumar reddy kasa
-- Raspberry Pi detection issue reported by Filippo GentooPlayer developer
-- Special thanks to Yu Harada for Diretta SDK support
+| Metric | Before | After |
+|--------|--------|-------|
+| Heap allocations per DSD read | 2 (std::vector) | 0 (steady state) |
+| Memory pattern | Alloc/free every call | Pre-allocated, reused |
 
 ---
 
-## Summary of Critical Fixes in v1.1.1
+## 2026-01-13
 
-| Issue | Severity | Affected Systems | Status |
-|-------|----------|------------------|--------|
-| Deadlock (no audio) | **CRITICAL** | RPi4, slower systems | ✅ **FIXED** |
-| Multi-interface ignored | **HIGH** | 3-tier setups | ✅ **FIXED** |
-| Wrong RPi variant | **CRITICAL** | RPi3/4 | ✅ **FIXED** |
+### 1. Full Integration of @leeeanh Optimizations
 
-**All critical issues resolved. v1.1.1 is recommended for all users, especially those on Raspberry Pi systems.**
+- Integrated all ring buffer optimizations from @leeeanh
+- Power-of-2 bitmask modulo for single-cycle operations
+- Cache-line separation to eliminate false sharing
+- Lock-free audio path with atomic operations
+- **Files:** `src/DirettaRingBuffer.h`, `src/DirettaSync.cpp`, `src/DirettaSync.h`
 
+### 2. FFmpeg Custom Build Configuration
 
-## [1.1.0] - 2025-12-24
+- Following leeeanh recommendations
+- Found optimal FFmpeg 7.1 configuration that works with DSD playback
+- Minimal build with only audio codecs needed (FLAC, ALAC, DSD, AAC, Vorbis, MP3)
+- Includes libsoxr for high-quality resampling
+- Includes HDCD filter support
+- Removed problematic `--disable-inline-asm` and `--disable-x86asm` flags
+- **Files:** `install.sh`
 
-### Added
-- 🌐 **Multi-interface support** for multi-homed systems
-  - New command-line option: `--interface <name>` to bind to specific network interface (e.g., eth0, eno1, enp6s0)
-  - New command-line option: `--bind-ip <address>` to bind to specific IP address (e.g., 192.168.1.10)
-  - Essential for 3-tier architecture configurations with separate control and audio networks
-  - Fixes SSDP discovery issues on systems with multiple network interfaces (VPN, multiple NICs, bridged networks)
-  - Auto-detection remains default behavior for single-interface systems (backward compatible)
-  
-- **Advanced Configuration with command-line Parameters**
-  - ### Basic Options
+### 3. Target Release Bug Fix
 
-```bash
---name, -n <name>       Renderer name (default: Diretta Renderer)
---port, -p <port>       UPnP port (default: auto)
---buffer, -b <seconds>  Buffer size in seconds (default: 2.0)
---target, -t <index>    Select Diretta target by index (1, 2, 3...)
---no-gapless            Disable gapless playback
---verbose               Enable verbose debug output
-```
- - ### Advanced Diretta SDK Options
-Fine-tune the Diretta protocol behavior for optimal performance such as Thread-mode, transfer timing....
+- Added `release()` function for proper disconnection when playlist ends
+- Previously, target remained "connected" after playback stopped
+- New `m_sdkOpen` flag tracks SDK-level connection state
+- `open()` now automatically reopens SDK if it was released
+- Ensures target can accept connections from other sources after playback
+- **Files:** `src/DirettaSync.cpp`, `src/DirettaSync.h`, `src/DirettaRenderer.cpp`
 
-### Fixed
-- **Critical**: Fixed format change freeze when transitioning between bit depths
-  - **Issue**: Playlist playback would freeze for 10 seconds when switching between 24-bit and 16-bit tracks
-  - **Root cause**: 4 residual samples in Diretta SDK buffer never drained, causing timeout
-  - **Solution**: Implemented force flush with silence padding to push incomplete frames through pipeline
-  - **Result**: Format changes now complete in ~200-300ms instead of 10-second timeout
-  - **Impact**: Smooth playlist playback with mixed formats (16-bit/24-bit/32-bit)
-- Improved error recovery during format transitions
-- Better handling of incomplete audio frames at track boundaries
+### 4. Install Script Enhancements
 
-### Changed
-- **UPnP Initialization**: Now uses `UpnpInit2()` with interface parameter for precise network binding
-- **Format Change Timeout**: Reduced from 10s to 3s for faster error recovery
-- **Buffer Drain Logic**: Added tolerance for ≤4 residual samples (considered "empty enough")
-- **Hardware Stabilization**: Increased from 200ms to 300ms for better reliability during format changes
-- **Logging**: Enhanced debug output during format change sequence with flush detection
+- Updated with working FFmpeg 7.1 build configuration
+- Added FFmpeg installation test suite:
+  - Checks required decoders (FLAC, ALAC, DSD, PCM)
+  - Checks required demuxers (FLAC, WAV, DSF, MOV)
+  - Checks required protocols (HTTP, HTTPS, FILE)
+  - Runs decode functionality test
+- Fixed directory handling after FFmpeg build
+- Installs to `/usr/local` (coexists with system FFmpeg)
+- **Files:** `install.sh`
 
-### Configuration
-- **Systemd**: New `NETWORK_INTERFACE` parameter in `/opt/diretta-renderer-upnp/diretta-renderer.conf`
-  ```bash
-  # For 3-tier architecture
-  NETWORK_INTERFACE="eth0"      # Interface connected to control points
-  
-  # Or by IP address
-  NETWORK_INTERFACE="192.168.1.10"
-  ```
-- **Wrapper Script**: Automatically detects whether parameter is IP address or interface name
+### 5. DSD→PCM Transition Fix for I2S Targets
 
-### Use Cases
+- Added special handling in `DirettaSync::open()` for DSD→PCM format transitions
+- I2S/LVDS targets are more timing-sensitive than USB and need cleaner transitions
+- DSD→PCM now performs: full `DIRETTA::Sync::close()` + 800ms delay + fresh `open()`
+- Other format transitions (PCM→DSD, PCM→PCM, DSD→DSD) unchanged
+- **Files:** `src/DirettaSync.cpp` (lines 372-421)
 
-#### Multi-Interface Scenarios
-1. **3-tier Architecture** (recommended by dsnyder):
-   - Control Points (JPlay, Roon) on 192.168.1.x via eth0
-   - Diretta DAC on 192.168.2.x via eth1
-   ```bash
-   sudo ./bin/DirettaRendererUPnP --interface eth0 --target 1
-   ```
+### 6. UPnP Stop Signal Handling
 
-2. **VPN + Local Network**:
-   - Local network on 192.168.1.x via eth0
-   - VPN on 10.0.0.x via tun0
-   ```bash
-   sudo ./bin/DirettaRendererUPnP --bind-ip 192.168.1.10 --target 1
-   ```
+- Diretta connection now properly closed when UPnP Stop action received
+- Ensures clean handoff when switching renderers
+- Pause action unchanged (keeps connection open)
+- **Files:** `src/DirettaRenderer.cpp` (lines 419-431)
 
-3. **Multiple Ethernet Adapters**:
-   - Specify which adapter handles UPnP discovery
-   ```bash
-   sudo ./bin/DirettaRendererUPnP --interface eno1 --target 1
-   ```
+### 7. Enhanced Target Listing
 
-#### Format Change Improvements
-- **Mixed Format Playlists**: Seamless transitions between 16-bit, 24-bit, and different sample rates
-- **Streaming Services**: Better compatibility with services like Qobuz that mix bit depths
-- **Gapless Playback**: Maintains gapless behavior even during format changes
-
-### Documentation
-- Added comprehensive **Multi-Homed Systems** section in README
-- Added troubleshooting guide for network interface selection
-- Added examples for common multi-interface configurations
-- Updated systemd configuration guide
-- Added FORMAT_CHANGE_FIX.md technical documentation
-
-### Technical Details
-
-#### Multi-Interface Implementation
-- Modified `UPnPDevice.cpp`: `UpnpInit2(interfaceName, port)` instead of `UpnpInit2(nullptr, port)`
-- Added `networkInterface` parameter to `UPnPDevice::Config` structure
-- Propagated interface selection from command-line → DirettaRenderer → UPnPDevice
-- Enhanced error messages when binding fails (suggests `ip link show`, permissions check)
-
-#### Format Change Fix Implementation
-- Added **Step 1.5** in `changeFormat()`: Force flush with 128 samples of silence padding
-  - Pushes incomplete frames through Diretta SDK pipeline
-  - Only triggered when residual < 64 samples detected
-- Modified drain logic to accept small residual (≤4 samples) as successful
-- Implemented `sendAudio()` function for unified audio data transmission
-- Better synchronization between AudioEngine and DirettaOutput during transitions
-
-### Breaking Changes
-None - all changes are backward compatible
-
-### Migration Guide
-No migration needed. Existing configurations continue to work:
-- Systems with single network interface: No changes required
-- Multi-interface systems: Add `--interface` or configure `NETWORK_INTERFACE` in systemd
-
-### Known Issues
-- None reported
-
-### Tested Configurations
-- ✅ Fedora 39/40 (x64)
-- ✅ Ubuntu 22.04/24.04 (x64)
-- ✅ AudioLinux (x64)
-- ✅ Raspberry Pi 4 (aarch64)
-- ✅ 3-tier architecture with Intel i225 + RTL8125 NICs
-- ✅ Mixed format playlists (16/24-bit, 44.1/96/192kHz)
-- ✅ Qobuz streaming (16/24-bit)
-- ✅ Local FLAC/WAV files
-- ✅ DSD64/128/256 playback
-
-### Performance
-- Format change latency: ~200-300ms (down from 10s)
-- Network discovery: Immediate on specified interface
-- Memory usage: Unchanged
-- CPU usage: Unchanged
-
-### Credits
-- Multi-interface support requested and tested by community members
-- Format change fix developed in collaboration with Yu Harada (Diretta protocol creator)
-- Testing and validation by early adopters on AudioPhile Style forum
+- `--list-targets` now shows detailed target information:
+  - Output name (e.g., "LVDS", "USB") - differentiates ports
+  - Port numbers (IN/OUT) and multiport flag
+  - SDK version
+  - Product ID
+- **Files:** `src/DirettaSync.cpp` (lines 269-325)
 
 ---
 
-## [1.0.8] - 2025-12-23
+## 2026-01-12 (thanks to @leeeanh)
 
-### Fixed
-- Fixed SEEK functionality deadlock issue
-  - Replaced mutex-based synchronization with atomic flag
-  - Implemented asynchronous seek mechanism
-  - Seek now completes in <100ms without blocking
+### 1. Power-of-2 Bitmask Modulo
 
-### Changed
-- Improved seek reliability and responsiveness
-- Better error handling during seek operations
+- Added `roundUpPow2()` helper function (lines 33-44)
+- Added `mask_` member variable (line 295)
+- `resize()` now rounds up to power-of-2 and sets `mask_ = size_ - 1`
+- Replaced all `% size_` with `& mask_` throughout:
+  - `getAvailable()` - line 69
+  - `getFreeSpace()` - line 73 (simplified)
+  - `push()` - line 106
+  - `push24BitPacked()` - lines 138, 141-142, 145
+  - `push16To32()` - lines 168, 172-174, 177
+  - `pushDSDPlanar()` - lines 214, 232-234, 237-239, 244
+  - `pop()` - line 268
 
-## [1.0.7] - 2025-12-22
+### 2. Cache-Line Separation
 
-### Added
-- Advanced Diretta SDK configuration options:
-  - `--thread-mode <value>`: Configure thread priority and behavior (bitmask)
-  - `--cycle-time <µs>`: Transfer packet cycle maximum time (default: 10000)
-  - `--cycle-min-time <µs>`: Transfer packet cycle minimum time (default: 333)
-  - `--info-cycle <µs>`: Information packet cycle time (default: 5000)
-  - `--mtu <bytes>`: Override MTU for network packets (default: auto-detect)
+- Added `alignas(64)` to `writePos_` (line 298)
+- Added `alignas(64)` to `readPos_` (line 299)
 
-### Changed
-- Buffer size parameter changed from integer to float for finer control
-  - Now accepts values like `--buffer 2.5` for 2.5 seconds
-- Improved buffer adaptation logic based on audio format complexity
-- Better MTU detection and configuration
+### Performance Impact
 
-### Documentation
-- Added comprehensive documentation for advanced Diretta SDK parameters
-- Added thread mode bitmask reference
-- Added MTU optimization guide
+| Operation     | Before                              | After                           |
+| ------------- | ----------------------------------- | ------------------------------- |
+| Modulo        | `% size_` (10-20 cycles)            | `& mask_` (1 cycle)             |
+| False sharing | Possible between writePos_/readPos_ | Eliminated (64-byte separation) |
 
-## [1.0.6] - 2025-12-21
+### Note
 
-### Fixed
-- Audirvana Studio streaming compatibility issues
-  - Fixed pink noise after 6-7 seconds when streaming 24-bit content from Qobuz
-  - Issue was related to HTTP streaming implementation vs Diretta SDK buffer handling
-  - Workaround: Use 16-bit or 20-bit streaming settings in Audirvana
+The buffer size will now be rounded up to the next power of 2. For example:
+- Request 3MB → allocate 4MB
+- Request 1.5MB → allocate 2MB
 
-### Changed
-- Improved buffer handling for HTTP streaming sources
-- Better error detection and recovery for streaming issues
-
-## [1.0.5] - 2025-12-20
-
-### Fixed
-- Format change handling improvements
-  - Fixed clicking sounds during 24-bit audio playback
-  - Removed artificial silence generation that caused artifacts
-  - Proper buffer draining using Diretta SDK's `buffer_empty()` methods
-
-### Changed
-- Improved audio playback behavior during track transitions
-- Better handling of sample rate changes
-
-## [1.0.4] - 2025-12-19
-
-### Added
-- Jumbo frame support with 16k MTU optimization
-- Configurable MTU settings for network optimization
-
-### Fixed
-- Network configuration issues with Intel i225 cards (limited to 9k MTU)
-- Buffer handling improvements
-
-## [1.0.3] - 2025-12-18
-
-### Added
-- Gapless playback support
-- Improved track transition handling
-
-### Changed
-- Better buffer management during track changes
-- Improved format detection and handling
-
-## [1.0.2] - 2025-12-17
-
-### Fixed
-- DSD playback improvements
-- Sample rate detection accuracy
-
-## [1.0.1] - 2025-12-16
-
-### Added
-- Support for multiple Diretta DAC targets
-- Interactive target selection
-- Command-line target specification
-
-### Fixed
-- Target discovery reliability
-- Connection stability improvements
-
-## [1.0.0] - 2025-12-15
-
-### Added
-- Initial release
-- UPnP MediaRenderer implementation
-- Diretta protocol integration
-- Support for PCM audio (16/24/32-bit, up to 768kHz)
-- Support for DSD audio (DSD64/128/256/512/1024)
-- AVTransport service (Play, Pause, Stop, Seek, Next, Previous)
-- RenderingControl service (Volume, Mute)
-- ConnectionManager service
-- Automatic SSDP discovery
-- Format-specific buffer optimization
-- Systemd service integration
-
-### Supported Formats
-- PCM: 16/24/32-bit, 44.1kHz to 768kHz
-- DSD: DSD64, DSD128, DSD256, DSD512, DSD1024
-- Containers: FLAC, WAV, AIFF, ALAC, APE, DSF, DFF
-
-### Supported Control Points
-- JPlay
-- Roon
-- BubbleUPnP
-- Any UPnP/DLNA control point
+This wastes some memory but the tradeoff is worth it for the consistent fast-path performance.
 
 ---
 
-## Version Numbering
+## 2026-01-11 (thanks to @leeeanh)
 
-- **Major.Minor.Patch** (e.g., 1.1.0)
-- **Major**: Breaking changes or complete rewrites
-- **Minor**: New features, significant improvements, backward compatible
-- **Patch**: Bug fixes, minor improvements, backward compatible
+### DirettaSync.h
 
-## Unreleased
+- Removed `m_pushMutex`
+- Added `m_reconfiguring` and `m_ringUsers` atomics for lock-free access
+- Converted 11 format parameters to `std::atomic<>` (`m_sampleRate`, `m_channels`, `m_bytesPerSample`, etc.)
+- Added `ReconfigureGuard` RAII class
+- Added `beginReconfigure()` / `endReconfigure()` method declarations
 
-### Planned Features
-- Web UI for configuration
-- Docker container support
-- Automatic format detection improvement
-- Multi-room synchronization
-- Volume normalization
-- Equalizer support
+### DirettaSync.cpp
+
+- Added `RingAccessGuard` class for lock-free ring buffer access
+- Added `beginReconfigure()` / `endReconfigure()` implementations
+- Updated `sendAudio()` to use `RingAccessGuard` instead of mutex (lock-free hot path)
+- Updated `configureRingPCM()`, `configureRingDSD()`, `fullReset()` to use `ReconfigureGuard`
+- Updated all format parameter accesses to use atomic load/store with proper memory ordering
+
+### DirettaRingBuffer.h
+
+- Added `S24PackMode` enum (`Unknown`, `LsbAligned`, `MsbAligned`)
+- Added `detectS24PackMode()` method that checks first 32 samples
+- Updated `push24BitPacked()` to auto-detect and handle both S24 formats
+- S24 detection resets on `clear()` and `resize()`
+
+---
+
+## Key Benefits
+
+1. **Lock-free audio path** - `sendAudio()` no longer takes any mutex
+2. **Safe reconfiguration** - `ReconfigureGuard` waits for active readers to drain
+3. **S24 format flexibility** - Handles both LSB-aligned (FFmpeg S24_LE) and MSB-aligned formats automatically

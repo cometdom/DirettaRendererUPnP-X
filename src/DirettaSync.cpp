@@ -10,6 +10,36 @@
 #include <stdexcept>
 #include <iomanip>
 
+namespace {
+class RingAccessGuard {
+public:
+    RingAccessGuard(std::atomic<int>& users, const std::atomic<bool>& reconfiguring)
+        : users_(users), active_(false) {
+        if (reconfiguring.load(std::memory_order_acquire)) {
+            return;
+        }
+        users_.fetch_add(1, std::memory_order_acq_rel);
+        if (reconfiguring.load(std::memory_order_acquire)) {
+            users_.fetch_sub(1, std::memory_order_acq_rel);
+            return;
+        }
+        active_ = true;
+    }
+
+    ~RingAccessGuard() {
+        if (active_) {
+            users_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    bool active() const { return active_; }
+
+private:
+    std::atomic<int>& users_;
+    bool active_;
+};
+} // namespace
+
 //=============================================================================
 // Bit reversal lookup table for DSD MSB<->LSB conversion
 //=============================================================================
@@ -91,6 +121,7 @@ void DirettaSync::disable() {
     if (m_enabled) {
         shutdownWorker();
         DIRETTA::Sync::close();
+        m_sdkOpen = false;
         m_calculator.reset();
         m_enabled = false;
     }
@@ -121,6 +152,7 @@ bool DirettaSync::openSyncConnection() {
         return false;
     }
 
+    m_sdkOpen = true;
     inquirySupportFormat(m_targetAddress);
 
     if (g_verbose) {
@@ -250,11 +282,37 @@ void DirettaSync::listTargets() {
         return;
     }
 
-    std::cout << "Available Diretta Targets (" << results.size() << " found):" << std::endl;
+    std::cout << "\nAvailable Diretta Targets (" << results.size() << " found):\n" << std::endl;
 
     int index = 1;
     for (const auto& target : results) {
-        std::cout << "[" << index << "] " << target.second.targetName << std::endl;
+        const auto& info = target.second;
+        std::cout << "[" << index << "] " << info.targetName << std::endl;
+
+        // Show output/port name if available (differentiates I2S vs USB, etc.)
+        if (!info.outputName.empty()) {
+            std::cout << "    Output: " << info.outputName << std::endl;
+        }
+
+        // Show port numbers
+        std::cout << "    Port: IN=" << info.PI << " OUT=" << info.PO;
+        if (info.multiport) {
+            std::cout << " (multiport)";
+        }
+        std::cout << std::endl;
+
+        // Show configuration URL if available
+        if (!info.config.empty()) {
+            std::cout << "    Config: " << info.config << std::endl;
+        }
+
+        // Show SDK version
+        std::cout << "    Version: " << info.version << std::endl;
+
+        // Show Product ID
+        std::cout << "    ProductID: 0x" << std::hex << info.productID << std::dec << std::endl;
+
+        std::cout << std::endl;
         index++;
     }
 
@@ -286,6 +344,16 @@ bool DirettaSync::open(const AudioFormat& format) {
         return false;
     }
 
+    // Reopen SDK if it was released (e.g., after playlist end)
+    if (!m_sdkOpen) {
+        std::cout << "[DirettaSync] SDK was released, reopening..." << std::endl;
+        if (!openSyncConnection()) {
+            std::cerr << "[DirettaSync] ERROR: Failed to reopen SDK" << std::endl;
+            return false;
+        }
+        std::cout << "[DirettaSync] SDK reopened successfully" << std::endl;
+    }
+
     bool newIsDsd = format.isDSD;
     bool needFullConnect = true;  // Whether we need connectPrepare/connect/connectWait
 
@@ -306,22 +374,92 @@ bool DirettaSync::open(const AudioFormat& format) {
 
         if (sameFormat) {
             std::cout << "[DirettaSync] Same format - quick resume (no setSink)" << std::endl;
-            // Light reset - just clear buffer and reset flags, don't stop workers
+
+            // Send silence before transition to flush Diretta pipeline
+            if (m_isDsdMode.load(std::memory_order_acquire)) {
+                requestShutdownSilence(30);
+                auto start = std::chrono::steady_clock::now();
+                while (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) {
+                    if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(100)) break;
+                    std::this_thread::yield();
+                }
+            }
+
+            // Clear buffer and reset flags
             m_ringBuffer.clear();
             m_prefillComplete = false;
+            m_postOnlineDelayDone = false;
+            m_stabilizationCount = 0;
             m_stopRequested = false;
+            m_draining = false;
+            m_silenceBuffersRemaining = 0;
             play();
             m_playing = true;
             m_paused = false;
             std::cout << "[DirettaSync] ========== OPEN COMPLETE (quick) ==========" << std::endl;
             return true;
         } else {
-            // Format change - need full reopen for reliable Target reconfiguration
-            // Some Targets need DIRETTA::Sync to be fully closed and reopened
-            std::cout << "[DirettaSync] Format change - full reopen" << std::endl;
-            if (!reopenForFormatChange()) {
-                std::cerr << "[DirettaSync] Failed to reopen for format change" << std::endl;
-                return false;
+            // Format change detected
+            bool wasDSD = m_previousFormat.isDSD;
+            bool nowPCM = !format.isDSD;
+
+            if (wasDSD && nowPCM) {
+                // DSD→PCM: Full close/reopen for clean I2S transition
+                // I2S targets are more timing-sensitive than USB and need a cleaner break
+                // Note: We can't send silence here because playback is already stopped
+                // (auto-stop happens before URI change), so getNewStream() isn't being called
+                std::cout << "[DirettaSync] DSD->PCM transition - full close/reopen for I2S compatibility" << std::endl;
+
+                int dsdMultiplier = m_previousFormat.sampleRate / 44100;
+                std::cout << "[DirettaSync] Previous format was DSD" << dsdMultiplier << std::endl;
+
+                // Clear any pending silence requests (playback is stopped, can't send anyway)
+                m_silenceBuffersRemaining = 0;
+
+                // Stop playback and disconnect
+                stop();
+                disconnect(true);
+
+                // Close DIRETTA::Sync completely (critical for DSD→PCM reset)
+                DIRETTA::Sync::close();
+
+                // Shutdown worker thread
+                m_running = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_workerMutex);
+                    if (m_workerThread.joinable()) {
+                        m_workerThread.join();
+                    }
+                }
+
+                m_open = false;
+                m_playing = false;
+                m_paused = false;
+
+                // Extended delay for I2S target to fully reset from DSD mode
+                // This is critical - the target needs time to switch from DSD clock to PCM clock
+                std::cout << "[DirettaSync] Waiting 800ms for I2S target to reset from DSD mode..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+                // Reopen DIRETTA::Sync fresh for PCM
+                ACQUA::Clock cycleTime = ACQUA::Clock::MicroSeconds(m_config.cycleTime);
+                if (!DIRETTA::Sync::open(
+                        DIRETTA::Sync::THRED_MODE(m_config.threadMode),
+                        cycleTime, 0, "DirettaRenderer", 0x44525400,
+                        -1, -1, 0, DIRETTA::Sync::MSMODE_MS3)) {
+                    std::cerr << "[DirettaSync] Failed to re-open DIRETTA::Sync after DSD->PCM" << std::endl;
+                    return false;
+                }
+                std::cout << "[DirettaSync] DIRETTA::Sync reopened for PCM" << std::endl;
+
+                // Fall through to full open path (needFullConnect is already true)
+            } else {
+                // Other format changes: use existing reopenForFormatChange()
+                std::cout << "[DirettaSync] Format change - reopen" << std::endl;
+                if (!reopenForFormatChange()) {
+                    std::cerr << "[DirettaSync] Failed to reopen for format change" << std::endl;
+                    return false;
+                }
             }
             needFullConnect = true;
         }
@@ -331,13 +469,13 @@ bool DirettaSync::open(const AudioFormat& format) {
     if (needFullConnect) {
         fullReset();
     }
-    m_isDsdMode = newIsDsd;
+    m_isDsdMode.store(newIsDsd, std::memory_order_release);
 
     uint32_t effectiveSampleRate;
     int effectiveChannels = format.channels;
     int bitsPerSample;
 
-    if (m_isDsdMode) {
+    if (m_isDsdMode.load(std::memory_order_acquire)) {
         uint32_t dsdBitRate = format.sampleRate;
         uint32_t byteRate = dsdBitRate / 8;
         effectiveSampleRate = dsdBitRate;
@@ -453,7 +591,7 @@ void DirettaSync::close() {
     }
 
     // Request shutdown silence
-    requestShutdownSilence(m_isDsdMode ? 50 : 20);
+    requestShutdownSilence(m_isDsdMode.load(std::memory_order_acquire) ? 50 : 20);
 
     auto start = std::chrono::steady_clock::now();
     while (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) {
@@ -482,18 +620,64 @@ void DirettaSync::close() {
     DIRETTA_LOG("Close() done");
 }
 
+void DirettaSync::release() {
+    std::cout << "[DirettaSync] Release() - fully releasing target" << std::endl;
+
+    // First do a normal close if still open
+    if (m_open) {
+        close();
+    }
+
+    // Now fully close the SDK connection so target is released
+    if (m_sdkOpen) {
+        DIRETTA_LOG("Closing SDK connection...");
+
+        // Shutdown worker thread
+        m_running = false;
+        {
+            std::lock_guard<std::mutex> lock(m_workerMutex);
+            if (m_workerThread.joinable()) {
+                m_workerThread.join();
+            }
+        }
+
+        // Close SDK-level connection
+        DIRETTA::Sync::close();
+        m_sdkOpen = false;
+
+        // Brief delay to ensure target processes the disconnect
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        std::cout << "[DirettaSync] Target released" << std::endl;
+    }
+
+    // Clear format state so next open() starts fresh
+    m_hasPreviousFormat = false;
+}
+
 bool DirettaSync::reopenForFormatChange() {
     DIRETTA_LOG("reopenForFormatChange: sending silence before format switch...");
 
     // Send silence buffers to let DAC mute gracefully before format change
-    // More silence for DSD to prevent loud cracks
-    int silenceBuffers = m_isDsdMode ? 100 : 30;
+    // Scale silence with DSD rate - higher rates need more buffers for same duration
+    int silenceBuffers = 30;  // PCM default
+    if (m_isDsdMode.load(std::memory_order_acquire)) {
+        // Calculate DSD multiplier from sample rate (DSD64=64, DSD128=128, etc.)
+        int dsdMultiplier = m_previousFormat.sampleRate / 44100;
+        // Base 100 buffers for DSD64, scale up for higher rates
+        // DSD64: 100, DSD128: 200, DSD256: 400, DSD512: 800
+        silenceBuffers = 100 * (dsdMultiplier / 64);
+        if (silenceBuffers < 100) silenceBuffers = 100;
+        if (silenceBuffers > 1000) silenceBuffers = 1000;
+        DIRETTA_LOG("DSD" << dsdMultiplier << " -> silence buffers: " << silenceBuffers);
+    }
     requestShutdownSilence(silenceBuffers);
 
-    // Wait for silence to be sent
+    // Wait for silence to be sent - scale timeout with buffer count
+    int timeoutMs = std::max(300, silenceBuffers * 2);
     auto start = std::chrono::steady_clock::now();
     while (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) {
-        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(300)) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeoutMs)) {
             DIRETTA_LOG("Silence timeout in reopenForFormatChange");
             break;
         }
@@ -562,7 +746,7 @@ void DirettaSync::fullReset() {
 
     {
         std::lock_guard<std::mutex> lock(m_configMutex);
-        std::lock_guard<std::mutex> pushLock(m_pushMutex);
+        ReconfigureGuard guard(*this);
 
         m_prefillComplete = false;
         m_postOnlineDelayDone = false;
@@ -570,12 +754,12 @@ void DirettaSync::fullReset() {
         m_stabilizationCount = 0;
         m_streamCount = 0;
         m_pushCount = 0;
-        m_isDsdMode = false;
-        m_needDsdBitReversal = false;
-        m_needDsdByteSwap = false;
-        m_isLowBitrate = false;
-        m_need24BitPack = false;
-        m_need16To32Upsample = false;
+        m_isDsdMode.store(false, std::memory_order_release);
+        m_needDsdBitReversal.store(false, std::memory_order_release);
+        m_needDsdByteSwap.store(false, std::memory_order_release);
+        m_isLowBitrate.store(false, std::memory_order_release);
+        m_need24BitPack.store(false, std::memory_order_release);
+        m_need16To32Upsample.store(false, std::memory_order_release);
 
         m_ringBuffer.clear();
     }
@@ -647,9 +831,10 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
                   DIRETTA::FormatID::FMT_DSD_BIG);
     if (checkSinkSupport(fmt)) {
         setSinkConfigure(fmt);
-        m_needDsdBitReversal = !sourceIsLSB;  // Reverse if source is MSB (DFF)
-        m_needDsdByteSwap = false;  // BIG endian = no swap
-        DIRETTA_LOG("Sink DSD: LSB | BIG" << (m_needDsdBitReversal ? " (bit reversal)" : ""));
+        m_needDsdBitReversal.store(!sourceIsLSB, std::memory_order_release);  // Reverse if source is MSB (DFF)
+        m_needDsdByteSwap.store(false, std::memory_order_release);  // BIG endian = no swap
+        DIRETTA_LOG("Sink DSD: LSB | BIG"
+                    << (m_needDsdBitReversal.load(std::memory_order_acquire) ? " (bit reversal)" : ""));
         return;
     }
 
@@ -660,9 +845,10 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
                   DIRETTA::FormatID::FMT_DSD_BIG);
     if (checkSinkSupport(fmt)) {
         setSinkConfigure(fmt);
-        m_needDsdBitReversal = sourceIsLSB;  // Reverse if source is LSB (DSF)
-        m_needDsdByteSwap = false;  // BIG endian = no swap
-        DIRETTA_LOG("Sink DSD: MSB | BIG" << (m_needDsdBitReversal ? " (bit reversal)" : ""));
+        m_needDsdBitReversal.store(sourceIsLSB, std::memory_order_release);  // Reverse if source is LSB (DSF)
+        m_needDsdByteSwap.store(false, std::memory_order_release);  // BIG endian = no swap
+        DIRETTA_LOG("Sink DSD: MSB | BIG"
+                    << (m_needDsdBitReversal.load(std::memory_order_acquire) ? " (bit reversal)" : ""));
         return;
     }
 
@@ -673,9 +859,11 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
                   DIRETTA::FormatID::FMT_DSD_LITTLE);
     if (checkSinkSupport(fmt)) {
         setSinkConfigure(fmt);
-        m_needDsdBitReversal = !sourceIsLSB;
-        m_needDsdByteSwap = true;  // LITTLE endian = swap bytes
-        DIRETTA_LOG("Sink DSD: LSB | LITTLE" << (m_needDsdBitReversal ? " (bit reversal)" : "") << " (byte swap)");
+        m_needDsdBitReversal.store(!sourceIsLSB, std::memory_order_release);
+        m_needDsdByteSwap.store(true, std::memory_order_release);  // LITTLE endian = swap bytes
+        DIRETTA_LOG("Sink DSD: LSB | LITTLE"
+                    << (m_needDsdBitReversal.load(std::memory_order_acquire) ? " (bit reversal)" : "")
+                    << " (byte swap)");
         return;
     }
 
@@ -686,9 +874,11 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
                   DIRETTA::FormatID::FMT_DSD_LITTLE);
     if (checkSinkSupport(fmt)) {
         setSinkConfigure(fmt);
-        m_needDsdBitReversal = sourceIsLSB;
-        m_needDsdByteSwap = true;  // LITTLE endian = swap bytes
-        DIRETTA_LOG("Sink DSD: MSB | LITTLE" << (m_needDsdBitReversal ? " (bit reversal)" : "") << " (byte swap)");
+        m_needDsdBitReversal.store(sourceIsLSB, std::memory_order_release);
+        m_needDsdByteSwap.store(true, std::memory_order_release);  // LITTLE endian = swap bytes
+        DIRETTA_LOG("Sink DSD: MSB | LITTLE"
+                    << (m_needDsdBitReversal.load(std::memory_order_acquire) ? " (bit reversal)" : "")
+                    << " (byte swap)");
         return;
     }
 
@@ -696,9 +886,10 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
     fmt.setFormat(DIRETTA::FormatID::FMT_DSD1);
     if (checkSinkSupport(fmt)) {
         setSinkConfigure(fmt);
-        m_needDsdBitReversal = !sourceIsLSB;
-        m_needDsdByteSwap = false;
-        DIRETTA_LOG("Sink DSD: FMT_DSD1 only" << (m_needDsdBitReversal ? " (bit reversal)" : ""));
+        m_needDsdBitReversal.store(!sourceIsLSB, std::memory_order_release);
+        m_needDsdByteSwap.store(false, std::memory_order_release);
+        DIRETTA_LOG("Sink DSD: FMT_DSD1 only"
+                    << (m_needDsdBitReversal.load(std::memory_order_acquire) ? " (bit reversal)" : ""));
         return;
     }
 
@@ -711,27 +902,29 @@ void DirettaSync::configureSinkDSD(uint32_t dsdBitRate, int channels, const Audi
 
 void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int inputBps) {
     std::lock_guard<std::mutex> lock(m_configMutex);
-    std::lock_guard<std::mutex> pushLock(m_pushMutex);
+    ReconfigureGuard guard(*this);
 
-    m_sampleRate = rate;
-    m_channels = channels;
-    m_bytesPerSample = direttaBps;
-    m_inputBytesPerSample = inputBps;
-    m_need24BitPack = (direttaBps == 3 && inputBps == 4);
-    m_need16To32Upsample = (direttaBps == 4 && inputBps == 2);
-    m_isDsdMode = false;
-    m_needDsdBitReversal = false;
-    m_needDsdByteSwap = false;
-    m_isLowBitrate = (direttaBps <= 2 && rate <= 48000);
+    m_sampleRate.store(rate, std::memory_order_release);
+    m_channels.store(channels, std::memory_order_release);
+    m_bytesPerSample.store(direttaBps, std::memory_order_release);
+    m_inputBytesPerSample.store(inputBps, std::memory_order_release);
+    m_need24BitPack.store(direttaBps == 3 && inputBps == 4, std::memory_order_release);
+    m_need16To32Upsample.store(direttaBps == 4 && inputBps == 2, std::memory_order_release);
+    m_isDsdMode.store(false, std::memory_order_release);
+    m_needDsdBitReversal.store(false, std::memory_order_release);
+    m_needDsdByteSwap.store(false, std::memory_order_release);
+    m_isLowBitrate.store(direttaBps <= 2 && rate <= 48000, std::memory_order_release);
 
     size_t bytesPerSecond = static_cast<size_t>(rate) * channels * direttaBps;
     size_t ringSize = DirettaBuffer::calculateBufferSize(bytesPerSecond, DirettaBuffer::PCM_BUFFER_SECONDS);
 
     m_ringBuffer.resize(ringSize, 0x00);
+    ringSize = m_ringBuffer.size();
 
-    m_bytesPerBuffer = ((rate + 999) / 1000) * channels * direttaBps;
+    m_bytesPerBuffer.store(((rate + 999) / 1000) * channels * direttaBps, std::memory_order_release);
 
-    m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, false, m_isLowBitrate);
+    m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, false,
+        m_isLowBitrate.load(std::memory_order_acquire));
     m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
     m_prefillComplete = false;
 
@@ -742,23 +935,25 @@ void DirettaSync::configureRingPCM(int rate, int channels, int direttaBps, int i
 
 void DirettaSync::configureRingDSD(uint32_t byteRate, int channels) {
     std::lock_guard<std::mutex> lock(m_configMutex);
-    std::lock_guard<std::mutex> pushLock(m_pushMutex);
+    ReconfigureGuard guard(*this);
 
-    m_isDsdMode = true;
-    m_need24BitPack = false;
-    m_need16To32Upsample = false;
-    m_channels = channels;
-    m_isLowBitrate = false;
+    m_isDsdMode.store(true, std::memory_order_release);
+    m_need24BitPack.store(false, std::memory_order_release);
+    m_need16To32Upsample.store(false, std::memory_order_release);
+    m_channels.store(channels, std::memory_order_release);
+    m_isLowBitrate.store(false, std::memory_order_release);
 
     uint32_t bytesPerSecond = byteRate * channels;
     size_t ringSize = DirettaBuffer::calculateBufferSize(bytesPerSecond, DirettaBuffer::DSD_BUFFER_SECONDS);
 
     m_ringBuffer.resize(ringSize, 0x69);  // DSD silence
+    ringSize = m_ringBuffer.size();
 
     uint32_t inputBytesPerMs = (byteRate / 1000) * channels;
-    m_bytesPerBuffer = inputBytesPerMs;
-    m_bytesPerBuffer = ((m_bytesPerBuffer + (4 * channels - 1)) / (4 * channels)) * (4 * channels);
-    if (m_bytesPerBuffer < 64) m_bytesPerBuffer = 64;
+    size_t bytesPerBuffer = inputBytesPerMs;
+    bytesPerBuffer = ((bytesPerBuffer + (4 * channels - 1)) / (4 * channels)) * (4 * channels);
+    if (bytesPerBuffer < 64) bytesPerBuffer = 64;
+    m_bytesPerBuffer.store(static_cast<int>(bytesPerBuffer), std::memory_order_release);
 
     m_prefillTarget = DirettaBuffer::calculatePrefill(bytesPerSecond, true, false);
     m_prefillTarget = std::min(m_prefillTarget, ringSize / 4);
@@ -791,7 +986,7 @@ void DirettaSync::stopPlayback(bool immediate) {
     if (!m_playing) return;
 
     if (!immediate) {
-        requestShutdownSilence(m_isDsdMode ? 50 : 20);
+        requestShutdownSilence(m_isDsdMode.load(std::memory_order_acquire) ? 50 : 20);
 
         auto start = std::chrono::steady_clock::now();
         while (m_silenceBuffersRemaining.load() > 0) {
@@ -808,7 +1003,7 @@ void DirettaSync::stopPlayback(bool immediate) {
 void DirettaSync::pausePlayback() {
     if (!m_playing || m_paused) return;
 
-    requestShutdownSilence(m_isDsdMode ? 30 : 10);
+    requestShutdownSilence(m_isDsdMode.load(std::memory_order_acquire) ? 30 : 10);
 
     auto start = std::chrono::steady_clock::now();
     while (m_silenceBuffersRemaining.load() > 0) {
@@ -823,9 +1018,22 @@ void DirettaSync::pausePlayback() {
 void DirettaSync::resumePlayback() {
     if (!m_paused) return;
 
+    DIRETTA_LOG("Resuming from pause...");
+
+    // Reset flags set during pausePlayback()
+    m_draining = false;
+    m_stopRequested = false;
+    m_silenceBuffersRemaining = 0;
+
+    // Clear stale buffer data and require fresh prefill
+    m_ringBuffer.clear();
+    m_prefillComplete = false;
+
     play();
     m_paused = false;
     m_playing = true;
+
+    DIRETTA_LOG("Resumed - buffer cleared, waiting for prefill");
 }
 
 //=============================================================================
@@ -837,20 +1045,17 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
     if (m_stopRequested.load(std::memory_order_acquire)) return 0;
     if (!is_online()) return 0;
 
-    std::lock_guard<std::mutex> lock(m_pushMutex);
+    RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
+    if (!ringGuard.active()) return 0;
 
     // Snapshot config state
-    bool dsdMode, pack24bit, upsample16to32, needBitReversal, needByteSwap;
-    int numChannels;
-    {
-        std::lock_guard<std::mutex> configLock(m_configMutex);
-        dsdMode = m_isDsdMode;
-        pack24bit = m_need24BitPack;
-        upsample16to32 = m_need16To32Upsample;
-        needBitReversal = m_needDsdBitReversal;
-        needByteSwap = m_needDsdByteSwap;
-        numChannels = m_channels;
-    }
+    bool dsdMode = m_isDsdMode.load(std::memory_order_acquire);
+    bool pack24bit = m_need24BitPack.load(std::memory_order_acquire);
+    bool upsample16to32 = m_need16To32Upsample.load(std::memory_order_acquire);
+    bool needBitReversal = m_needDsdBitReversal.load(std::memory_order_acquire);
+    bool needByteSwap = m_needDsdByteSwap.load(std::memory_order_acquire);
+    int numChannels = m_channels.load(std::memory_order_acquire);
+    int bytesPerSample = m_bytesPerSample.load(std::memory_order_acquire);
 
     size_t written = 0;
     size_t totalBytes;
@@ -886,7 +1091,7 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
 
     } else {
         // PCM direct copy
-        size_t bytesPerFrame = (m_bytesPerSample) * numChannels;
+        size_t bytesPerFrame = static_cast<size_t>(bytesPerSample) * numChannels;
         totalBytes = numSamples * bytesPerFrame;
 
         written = m_ringBuffer.push(data, totalBytes);
@@ -902,11 +1107,13 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
             }
         }
 
-        int count = m_pushCount.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (count <= 3 || count % 500 == 0) {
-            DIRETTA_LOG("sendAudio #" << count << " in=" << totalBytes
-                        << " out=" << written << " avail=" << m_ringBuffer.getAvailable()
-                        << " [" << formatLabel << "]");
+        if (g_verbose) {
+            int count = m_pushCount.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 3 || count % 500 == 0) {
+                DIRETTA_LOG("sendAudio #" << count << " in=" << totalBytes
+                            << " out=" << written << " avail=" << m_ringBuffer.getAvailable()
+                            << " [" << formatLabel << "]");
+            }
         }
     }
 
@@ -914,6 +1121,8 @@ size_t DirettaSync::sendAudio(const uint8_t* data, size_t numSamples) {
 }
 
 float DirettaSync::getBufferLevel() const {
+    RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
+    if (!ringGuard.active()) return 0.0f;
     size_t size = m_ringBuffer.size();
     if (size == 0) return 0.0f;
     return static_cast<float>(m_ringBuffer.getAvailable()) / static_cast<float>(size);
@@ -926,24 +1135,24 @@ float DirettaSync::getBufferLevel() const {
 bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
     m_workerActive = true;
 
-    // Snapshot config under mutex
-    int currentBytesPerBuffer;
-    uint8_t currentSilenceByte;
-    bool currentIsDsd;
-    size_t currentRingSize;
-    {
-        std::lock_guard<std::mutex> lock(m_configMutex);
-        currentBytesPerBuffer = m_bytesPerBuffer;
-        currentSilenceByte = m_ringBuffer.silenceByte();
-        currentIsDsd = m_isDsdMode;
-        currentRingSize = m_ringBuffer.size();
-    }
+    int currentBytesPerBuffer = m_bytesPerBuffer.load(std::memory_order_acquire);
+    uint8_t currentSilenceByte = m_ringBuffer.silenceByte();
 
     if (stream.size() != static_cast<size_t>(currentBytesPerBuffer)) {
         stream.resize(currentBytesPerBuffer);
     }
 
     uint8_t* dest = reinterpret_cast<uint8_t*>(stream.get_16());
+
+    RingAccessGuard ringGuard(m_ringUsers, m_reconfiguring);
+    if (!ringGuard.active()) {
+        std::memset(dest, currentSilenceByte, currentBytesPerBuffer);
+        m_workerActive = false;
+        return true;
+    }
+
+    bool currentIsDsd = m_isDsdMode.load(std::memory_order_acquire);
+    size_t currentRingSize = m_ringBuffer.size();
 
     // Shutdown silence
     int silenceRemaining = m_silenceBuffersRemaining.load(std::memory_order_acquire);
@@ -981,10 +1190,10 @@ bool DirettaSync::getNewStream(DIRETTA::Stream& stream) {
         return true;
     }
 
-    int count = m_streamCount.fetch_add(1, std::memory_order_acq_rel) + 1;
+    int count = m_streamCount.fetch_add(1, std::memory_order_relaxed) + 1;
     size_t avail = m_ringBuffer.getAvailable();
 
-    if (count <= 5 || count % 5000 == 0) {
+    if (g_verbose && (count <= 5 || count % 5000 == 0)) {
         float fillPct = (currentRingSize > 0) ? (100.0f * avail / currentRingSize) : 0.0f;
         DIRETTA_LOG("getNewStream #" << count << " bpb=" << currentBytesPerBuffer
                     << " avail=" << avail << " (" << std::fixed << std::setprecision(1)
@@ -1039,6 +1248,17 @@ bool DirettaSync::startSyncWorker() {
 // Internal Helpers
 //=============================================================================
 
+void DirettaSync::beginReconfigure() {
+    m_reconfiguring.store(true, std::memory_order_release);
+    while (m_ringUsers.load(std::memory_order_acquire) > 0) {
+        std::this_thread::yield();
+    }
+}
+
+void DirettaSync::endReconfigure() {
+    m_reconfiguring.store(false, std::memory_order_release);
+}
+
 void DirettaSync::shutdownWorker() {
     m_stopRequested = true;
     m_running = false;
@@ -1081,7 +1301,8 @@ bool DirettaSync::waitForOnline(unsigned int timeoutMs) {
 
 void DirettaSync::applyTransferMode(DirettaTransferMode mode, ACQUA::Clock cycleTime) {
     if (mode == DirettaTransferMode::AUTO) {
-        if (m_isLowBitrate || m_isDsdMode) {
+        if (m_isLowBitrate.load(std::memory_order_acquire) ||
+            m_isDsdMode.load(std::memory_order_acquire)) {
             DIRETTA_LOG("Using VarAuto");
             configTransferVarAuto(cycleTime);
         } else {
