@@ -84,7 +84,7 @@ namespace DirettaBuffer {
     constexpr unsigned int DAC_STABILIZATION_MS = 300;
     constexpr unsigned int ONLINE_WAIT_MS = 2000;
     constexpr unsigned int FORMAT_SWITCH_DELAY_MS = 800;
-    constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 100;
+    constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 50;
 
     // UPnP push model needs larger buffers than MPD's pull model
     // 64KB = ~370ms floor at 44.1kHz/16-bit, negligible at higher rates
@@ -115,7 +115,7 @@ namespace DirettaBuffer {
 
         // Limits
         constexpr size_t MIN_DSD_SAMPLES = 8192;   // ~3ms at DSD64
-        constexpr size_t MAX_DSD_SAMPLES = 131072; // ~46ms at DSD64, ~3ms at DSD1024
+        constexpr size_t MAX_DSD_SAMPLES = 32768; // ~46ms at DSD64, ~3ms at DSD1024
 
         // Calculate samples for target duration
         // DSD sample rate is the 1-bit rate (e.g., 2822400 for DSD64)
