@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-01-15 (Session 3) - TEST BUILD
+
+### Format Transition Noise Investigation
+
+**Purpose:** Test build to diagnose switching noise during format transitions. Pre-transition silence buffers were suspected of contributing to the noise rather than preventing it.
+
+**Changes:**
+
+| Setting | Original | Test Value |
+|---------|----------|------------|
+| Pre-transition silence | Enabled (100-1000 buffers) | **Disabled** |
+| DSD→PCM delay | 800ms | **400ms** |
+| DSD rate change delay | 400ms | 400ms (unchanged) |
+| PCM rate change delay | 200ms | **100ms** |
+
+**Files modified:**
+- `src/DirettaSync.cpp`:
+  - `sendPreTransitionSilence()` (line 1140-1142) - Early return added
+  - `reopenForFormatChange()` (line 730-758) - Silence wrapped in `#if 0`
+  - DSD→PCM delay (line 459) - Reduced from 800 to 400
+  - PCM rate change delay (line 506) - Reduced from 200 to 100
+
+**To revert:**
+1. Remove early `return` in `sendPreTransitionSilence()`
+2. Change `#if 0` to `#if 1` in `reopenForFormatChange()`
+3. Restore delay values: DSD→PCM=800, PCM rate=200
+
+---
+
 ## 2026-01-15 (Session 2)
 
 ### PCM FIFO and Bypass Optimization (thanks to @leeeanh)
