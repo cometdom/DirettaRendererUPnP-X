@@ -152,22 +152,21 @@ bool AudioDecoder::open(const std::string& url) {
         DEBUG_LOG("[AudioDecoder] Stream duration: unknown (live stream?)");
     }
 
-    // Find audio stream
-    m_audioStreamIndex = -1;
-    for (unsigned int i = 0; i < m_formatContext->nb_streams; i++) {
-        if (m_formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            m_audioStreamIndex = i;
-            break;
-        }
-    }
+    // Find audio stream using FFmpeg's recommended API (handles NULL codecpar in FFmpeg 5.x)
+    m_audioStreamIndex = av_find_best_stream(m_formatContext, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
-    if (m_audioStreamIndex == -1) {
+    if (m_audioStreamIndex < 0) {
         std::cerr << "[AudioDecoder] No audio stream found" << std::endl;
         avformat_close_input(&m_formatContext);
         return false;
     }
 
     AVStream* audioStream = m_formatContext->streams[m_audioStreamIndex];
+    if (!audioStream || !audioStream->codecpar) {
+        std::cerr << "[AudioDecoder] Audio stream has invalid codec parameters" << std::endl;
+        avformat_close_input(&m_formatContext);
+        return false;
+    }
     AVCodecParameters* codecpar = audioStream->codecpar;
 
     // ═══════════════════════════════════════════════════════════

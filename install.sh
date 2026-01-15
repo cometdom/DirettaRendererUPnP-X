@@ -15,6 +15,8 @@ set -e  # Exit on error
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SDK_PATH="${DIRETTA_SDK_PATH:-$HOME/DirettaHostSDK_147}"
 FFMPEG_BUILD_DIR="/tmp/ffmpeg-build"
+FFMPEG_HEADERS_DIR="$SCRIPT_DIR/ffmpeg-headers"
+FFMPEG_TARGET_VERSION="5.1.2"
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -206,6 +208,7 @@ get_ffmpeg_configure_opts() {
 --disable-outdevs
 --disable-devices
 --disable-filters
+--disable-inline-asm
 --disable-doc
 --enable-muxer=flac,mov,ipod,wav,w64,ffmetadata
 --enable-demuxer=flac,mov,wav,w64,ffmetadata,dsf,dff,aac,hls,mpegts,mp3,ogg,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,lavfi
@@ -476,7 +479,7 @@ install_ffmpeg() {
 
     case $FFMPEG_OPTION in
         1)
-            build_ffmpeg_from_source "7.1"
+            build_ffmpeg_from_source "5.1.2"
             configure_ffmpeg_paths
             rm -rf "$FFMPEG_BUILD_DIR"
             test_ffmpeg_installation "/usr/local/bin/ffmpeg"
@@ -504,6 +507,152 @@ install_ffmpeg() {
             exit 1
             ;;
     esac
+}
+
+# =============================================================================
+# FFMPEG HEADERS FOR COMPILATION (ABI COMPATIBILITY)
+# =============================================================================
+
+# Download FFmpeg source headers to ensure ABI compatibility
+# This is needed when runtime FFmpeg differs from system dev headers
+download_ffmpeg_headers() {
+    local version="${1:-$FFMPEG_TARGET_VERSION}"
+
+    print_info "Downloading FFmpeg $version headers for compilation..."
+
+    if [ -d "$FFMPEG_HEADERS_DIR" ] && [ -f "$FFMPEG_HEADERS_DIR/.version" ]; then
+        local existing_ver
+        existing_ver=$(cat "$FFMPEG_HEADERS_DIR/.version")
+        if [ "$existing_ver" = "$version" ]; then
+            print_success "FFmpeg $version headers already present"
+            return 0
+        fi
+    fi
+
+    mkdir -p "$FFMPEG_HEADERS_DIR"
+    cd "$FFMPEG_HEADERS_DIR"
+
+    local tarball="ffmpeg-${version}.tar.xz"
+    local url="https://ffmpeg.org/releases/$tarball"
+
+    if [ ! -f "$tarball" ]; then
+        print_info "Downloading FFmpeg ${version} source..."
+        if ! wget -q --show-progress "$url"; then
+            # Try .tar.bz2 for older versions
+            tarball="ffmpeg-${version}.tar.bz2"
+            url="https://ffmpeg.org/releases/$tarball"
+            wget -q --show-progress "$url" || {
+                print_error "Failed to download FFmpeg $version"
+                return 1
+            }
+        fi
+    fi
+
+    print_info "Extracting headers..."
+    tar xf "$tarball"
+
+    # Create symlinks to header directories
+    rm -f libavformat libavcodec libavutil libswresample
+    ln -sf "ffmpeg-${version}/libavformat" libavformat
+    ln -sf "ffmpeg-${version}/libavcodec" libavcodec
+    ln -sf "ffmpeg-${version}/libavutil" libavutil
+    ln -sf "ffmpeg-${version}/libswresample" libswresample
+
+    # Store version for future checks
+    echo "$version" > .version
+
+    # Clean up tarball to save space
+    rm -f "$tarball"
+
+    cd "$SCRIPT_DIR"
+    print_success "FFmpeg $version headers ready at $FFMPEG_HEADERS_DIR"
+}
+
+# Check if system FFmpeg headers match runtime version
+check_ffmpeg_abi_compatibility() {
+    print_info "Checking FFmpeg ABI compatibility..."
+
+    # Get runtime version
+    local runtime_ver=""
+    if command -v ffmpeg &> /dev/null; then
+        runtime_ver=$(ffmpeg -version 2>&1 | head -1 | grep -oP 'ffmpeg version \K[0-9]+\.[0-9]+(\.[0-9]+)?' || echo "")
+    fi
+
+    if [ -z "$runtime_ver" ]; then
+        print_warning "Could not detect FFmpeg runtime version"
+        return 1
+    fi
+
+    print_info "Runtime FFmpeg version: $runtime_ver"
+
+    # Get compile-time version from system headers
+    local header_paths=(
+        "/usr/include/ffmpeg/libavformat/version.h"
+        "/usr/include/libavformat/version.h"
+        "/usr/local/include/libavformat/version.h"
+    )
+
+    local compile_major=""
+    for hpath in "${header_paths[@]}"; do
+        if [ -f "$hpath" ]; then
+            compile_major=$(grep -oP 'LIBAVFORMAT_VERSION_MAJOR\s+\K[0-9]+' "$hpath" 2>/dev/null || echo "")
+            if [ -n "$compile_major" ]; then
+                print_info "System headers libavformat major version: $compile_major"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$compile_major" ]; then
+        print_warning "Could not detect FFmpeg header version"
+        return 1
+    fi
+
+    # Map runtime version to expected libavformat major version
+    local runtime_major="${runtime_ver%%.*}"
+    local expected_major=""
+    case "$runtime_major" in
+        4) expected_major="58" ;;
+        5) expected_major="59" ;;
+        6) expected_major="60" ;;
+        7) expected_major="61" ;;
+        *) expected_major="" ;;
+    esac
+
+    if [ "$compile_major" != "$expected_major" ]; then
+        print_warning "ABI MISMATCH DETECTED!"
+        print_warning "  System headers: libavformat $compile_major (FFmpeg ${compile_major#5}+)"
+        print_warning "  Runtime library: FFmpeg $runtime_ver (expects libavformat $expected_major)"
+        print_info "Will download FFmpeg $runtime_ver headers for compilation"
+        return 1
+    fi
+
+    print_success "FFmpeg headers match runtime version"
+    return 0
+}
+
+# Ensure FFmpeg headers are available for the target version
+ensure_ffmpeg_headers() {
+    local target_ver="${1:-$FFMPEG_TARGET_VERSION}"
+
+    # Check if we already have matching headers
+    if [ -d "$FFMPEG_HEADERS_DIR" ] && [ -f "$FFMPEG_HEADERS_DIR/.version" ]; then
+        local existing_ver
+        existing_ver=$(cat "$FFMPEG_HEADERS_DIR/.version")
+        if [ "$existing_ver" = "$target_ver" ]; then
+            print_success "Using FFmpeg $target_ver headers from $FFMPEG_HEADERS_DIR"
+            return 0
+        fi
+    fi
+
+    # Check system headers compatibility
+    if check_ffmpeg_abi_compatibility; then
+        print_info "System FFmpeg headers are compatible, no download needed"
+        return 0
+    fi
+
+    # Download headers for target version
+    download_ffmpeg_headers "$target_ver"
 }
 
 # =============================================================================
@@ -569,12 +718,23 @@ build_renderer() {
         exit 1
     fi
 
+    # Ensure FFmpeg headers are available for ABI compatibility
+    print_info "Checking FFmpeg header compatibility..."
+    ensure_ffmpeg_headers "$FFMPEG_TARGET_VERSION"
+
     # Clean and build
     make clean 2>/dev/null || true
 
     # Set SDK path via environment variable
     export DIRETTA_SDK_PATH="$SDK_PATH"
-    make
+
+    # Use local FFmpeg headers if available (for ABI compatibility)
+    if [ -d "$FFMPEG_HEADERS_DIR" ] && [ -f "$FFMPEG_HEADERS_DIR/.version" ]; then
+        print_info "Building with FFmpeg headers from $FFMPEG_HEADERS_DIR"
+        make FFMPEG_PATH="$FFMPEG_HEADERS_DIR"
+    else
+        make
+    fi
 
     if [ ! -f "bin/DirettaRendererUPnP" ]; then
         print_error "Build failed. Please check error messages above."

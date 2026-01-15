@@ -2,6 +2,60 @@
 
 ## 2026-01-15
 
+### FFmpeg ABI Compatibility Fix
+
+**Problem:** Segmentation fault when running against FFmpeg 5.x libraries after compiling on a system with FFmpeg 7.x development headers. Crash occurred in `AudioDecoder::open()` when accessing `AVStream->codecpar`.
+
+**Root cause:**
+- Compile-time FFmpeg headers (libavformat 61.x from FFmpeg 7.x) have different `AVStream` structure layout than runtime libraries (libavformat 59.x from FFmpeg 5.x)
+- The `codecpar` field offset differs between versions, causing garbage pointer dereference
+- Debug output showed: `codecpar=0x5622000000001` (garbage) instead of valid pointer
+
+**Solution - Multi-layered approach:**
+
+1. **AudioEngine.cpp** - Safer stream detection:
+   - Replaced manual stream iteration loop with `av_find_best_stream()` (FFmpeg's recommended API)
+   - Added NULL checks for `audioStream` and `audioStream->codecpar` after retrieval
+   - Handles edge cases in FFmpeg 5.x where codecpar may be invalid
+
+2. **install.sh** - Automatic header management:
+   - Added `download_ffmpeg_headers()` - downloads FFmpeg source for headers only
+   - Added `check_ffmpeg_abi_compatibility()` - detects runtime vs compile-time version mismatch
+   - Added `ensure_ffmpeg_headers()` - auto-downloads correct headers when needed
+   - `build_renderer()` now automatically uses `make FFMPEG_PATH=./ffmpeg-headers`
+   - New config variables: `FFMPEG_HEADERS_DIR`, `FFMPEG_TARGET_VERSION="5.1.2"`
+
+3. **Makefile** - Auto-detection and warnings:
+   - Auto-detects `./ffmpeg-headers/` directory (created by install.sh)
+   - Shows clear warning box when using system headers
+   - Supports explicit override: `make FFMPEG_PATH=/path/to/headers`
+
+4. **New .gitignore** - Excludes downloaded headers from version control
+
+**Usage:**
+```bash
+# Option A: Use install.sh (recommended - auto-downloads headers)
+./install.sh --build
+
+# Option B: Manual download
+wget https://ffmpeg.org/releases/ffmpeg-5.1.2.tar.xz
+tar xf ffmpeg-5.1.2.tar.xz
+mv ffmpeg-5.1.2 ffmpeg-headers
+make clean && make
+
+# Option C: Explicit path
+make clean && make FFMPEG_PATH=/path/to/ffmpeg-5.1.2
+```
+
+**Files:**
+- `src/AudioEngine.cpp` (lines 139-171) - Stream detection rewrite
+- `install.sh` (lines 512-656) - Header download functions
+- `install.sh` (lines 721-734) - Build with correct headers
+- `Makefile` (lines 181-229) - FFmpeg path auto-detection
+- `.gitignore` - New file
+
+---
+
 ### Pre-Transition Silence for DSD Format Changes
 
 **Problem:** Crackling noise when switching DSD rates or transitioning DSD→PCM, despite previous fixes (full close/reopen with delays). The issue reappeared after Zen3 stabilization buffer changes.

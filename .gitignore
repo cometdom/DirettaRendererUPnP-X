@@ -1,0 +1,19 @@
+# Build artifacts
+obj/
+bin/
+*.o
+*.d
+
+# FFmpeg headers (downloaded for ABI compatibility)
+ffmpeg-headers/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
