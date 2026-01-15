@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-01-15
+
+### Pre-Transition Silence for DSD Format Changes
+
+**Problem:** Crackling noise when switching DSD rates or transitioning DSD→PCM, despite previous fixes (full close/reopen with delays). The issue reappeared after Zen3 stabilization buffer changes.
+
+**Root cause analysis:**
+- When `onSetURI` receives a new track, it calls `stopPlayback(true)` (immediate)
+- With `immediate=true`, NO silence buffers are sent before stopping
+- The Diretta target's internal buffers still contain old DSD audio
+- Comment in code acknowledged this: "We can't send silence here because playback is already stopped"
+- The Zen3 stabilization change (longer post-online warmup) gave more time for residual audio artifacts to manifest
+
+**Solution:** Added `sendPreTransitionSilence()` method that sends rate-scaled silence BEFORE calling `stopPlayback()`:
+
+| DSD Rate | Silence Buffers | Rationale |
+|----------|-----------------|-----------|
+| DSD64    | 100             | Base level |
+| DSD128   | 200             | 2× data rate |
+| DSD256   | 400             | 4× data rate |
+| DSD512   | 800             | 8× data rate |
+| PCM      | 30              | Lower throughput |
+
+**Implementation:**
+- New public method `DirettaSync::sendPreTransitionSilence()`
+- Calculates silence buffers based on current DSD rate: `100 × (sampleRate / 2822400)`
+- Waits for silence to be consumed by `getNewStream()` (timeout scales with buffer count)
+- Called in two locations:
+  1. `onSetURI` callback before `stopPlayback()` (normal track change)
+  2. Audio callback format change detection (gapless transitions)
+
+**Transition flow after fix:**
+```
+1. onSetURI receives new track
+2. m_audioEngine->stop()
+3. waitForCallbackComplete()
+4. sendPreTransitionSilence()  ← NEW: Flushes Diretta pipeline
+5. stopPlayback(true)
+6. [New format open() proceeds with clean target state]
+```
+
+**Files:**
+- `src/DirettaSync.h` (lines 244-251) - Method declaration
+- `src/DirettaSync.cpp` (lines 1058-1103) - Implementation
+- `src/DirettaRenderer.cpp` (lines 366-368, 226-228) - Call sites
+
+**Status:** Significantly improved. If crackling persists in edge cases, consider:
+- Increasing silence buffer multiplier
+- Adjusting timeout scaling
+- Adding post-silence delay before `stopPlayback()`
+
 ## 2026-01-14
 
 ### 1. DSD Buffer Optimization - Pre-allocated Buffers
@@ -118,6 +169,55 @@ Complete rewrite of `install.sh` with modular architecture and improved FFmpeg h
 - Intended for dedicated audio servers only
 
 - **Files:** `install.sh`
+
+### 6. CPU Isolation and Thread Distribution Tuner Scripts
+
+Added two tuner scripts for CPU core isolation and real-time scheduling optimization.
+
+**Common features (both scripts):**
+- CPU isolation via kernel parameters (`isolcpus`, `nohz_full`, `rcu_nocbs`)
+- Systemd slice for CPU pinning
+- Real-time FIFO scheduling (priority 90)
+- IRQ affinity to housekeeping cores
+- CPU governor set to performance
+- Automatic thread distribution across cores (via `ExecStartPost`)
+- Manual `redistribute` command for testing without service restart
+
+**Option 1: `diretta-renderer-tuner.sh` (SMT enabled)**
+
+For systems where SMT (Hyper-Threading) is acceptable:
+- Housekeeping: cores 0,8 (1 physical core + SMT sibling)
+- Renderer: cores 1-7,9-15 (14 logical CPUs)
+- 11 threads distributed across 14 CPUs (~1 thread per CPU)
+
+**Option 2: `diretta-renderer-tuner-nosmt.sh` (SMT disabled)**
+
+For dedicated audio servers with low system load:
+- Adds `nosmt` kernel parameter to disable Hyper-Threading
+- Housekeeping: core 0 (1 physical core)
+- Renderer: cores 1-7 (7 physical cores)
+- 11 threads distributed across 7 cores (~1.5 threads per core)
+
+**Recommendation:**
+- For dedicated low-load audio servers: **no-SMT** provides more predictable latency
+- For multi-purpose systems: **SMT** provides more parallelism
+
+**Usage:**
+```bash
+# Apply configuration (requires reboot for kernel params)
+sudo ./diretta-renderer-tuner.sh apply
+
+# Test thread distribution immediately (no reboot)
+sudo ./diretta-renderer-tuner.sh redistribute
+
+# Check current status and thread layout
+sudo ./diretta-renderer-tuner.sh status
+
+# Revert all changes
+sudo ./diretta-renderer-tuner.sh revert
+```
+
+- **Files:** `diretta-renderer-tuner.sh`, `diretta-renderer-tuner-nosmt.sh`
 
 ---
 

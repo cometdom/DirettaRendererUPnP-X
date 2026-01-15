@@ -1055,6 +1055,53 @@ void DirettaSync::resumePlayback() {
     DIRETTA_LOG("Resumed - buffer cleared, waiting for prefill");
 }
 
+void DirettaSync::sendPreTransitionSilence() {
+    if (!m_playing.load(std::memory_order_acquire)) {
+        DIRETTA_LOG("sendPreTransitionSilence: not playing, skipping");
+        return;
+    }
+
+    // Calculate silence buffers based on format
+    // DSD needs more silence, scaled by rate (DSD512 needs more than DSD64)
+    int silenceBuffers;
+    if (m_isDsdMode.load(std::memory_order_acquire)) {
+        // Get DSD multiplier (DSD64=1, DSD128=2, DSD256=4, DSD512=8)
+        int sampleRate = m_sampleRate.load(std::memory_order_acquire);
+        int dsdMultiplier = sampleRate / 2822400;  // DSD64 base rate
+        if (dsdMultiplier < 1) dsdMultiplier = 1;
+
+        // Scale silence: DSD64=100, DSD128=200, DSD256=400, DSD512=800
+        silenceBuffers = 100 * dsdMultiplier;
+        silenceBuffers = std::max(100, std::min(silenceBuffers, 1000));
+
+        DIRETTA_LOG("Pre-transition silence: DSD" << (dsdMultiplier * 64)
+                    << " -> " << silenceBuffers << " buffers");
+    } else {
+        // PCM needs less silence
+        silenceBuffers = 30;
+        DIRETTA_LOG("Pre-transition silence: PCM -> " << silenceBuffers << " buffers");
+    }
+
+    requestShutdownSilence(silenceBuffers);
+
+    // Wait for silence to be consumed by getNewStream()
+    // Timeout scales with buffer count to avoid blocking forever
+    int timeoutMs = std::max(300, silenceBuffers * 2);
+    auto start = std::chrono::steady_clock::now();
+
+    while (m_silenceBuffersRemaining.load(std::memory_order_acquire) > 0) {
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(timeoutMs)) {
+            DIRETTA_LOG("Pre-transition silence timeout after " << timeoutMs << "ms");
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    DIRETTA_LOG("Pre-transition silence complete in " << elapsed << "ms");
+}
+
 //=============================================================================
 // Audio Data (Push Interface)
 //=============================================================================
