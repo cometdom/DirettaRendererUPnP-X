@@ -77,11 +77,11 @@ namespace DirettaBuffer {
     constexpr float DSD_BUFFER_SECONDS = 0.8f;
     constexpr float PCM_BUFFER_SECONDS = 0.3f;  // Was 1.0f - low latency
 
-    constexpr size_t DSD_PREFILL_MS = 50;
+    constexpr size_t DSD_PREFILL_MS = 200;
     constexpr size_t PCM_PREFILL_MS = 30;       // Was 50 - faster start
     constexpr size_t PCM_LOWRATE_PREFILL_MS = 100;
 
-    constexpr unsigned int DAC_STABILIZATION_MS = 300;
+    constexpr unsigned int DAC_STABILIZATION_MS = 100;
     constexpr unsigned int ONLINE_WAIT_MS = 2000;
     constexpr unsigned int FORMAT_SWITCH_DELAY_MS = 800;
     constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 50;
@@ -268,16 +268,6 @@ public:
     float getBufferLevel() const;
     const AudioFormat& getFormat() const { return m_currentFormat; }
 
-    /**
-     * @brief Set S24 pack mode hint for 24-bit audio
-     *
-     * Propagates alignment hint from TrackInfo to ring buffer for better
-     * 24-bit sample detection when track starts with silence.
-     */
-    void setS24PackModeHint(DirettaRingBuffer::S24PackMode hint) {
-        m_ringBuffer.setS24PackModeHint(hint);
-    }
-
     //=========================================================================
     // Target Management
     //=========================================================================
@@ -384,9 +374,6 @@ private:
     std::atomic<bool> m_needDsdBitReversal{false};
     std::atomic<bool> m_needDsdByteSwap{false};  // For LITTLE endian targets
     std::atomic<bool> m_isLowBitrate{false};
-
-    // Cached DSD conversion mode - set at track open, eliminates per-iteration branch checks
-    DirettaRingBuffer::DSDConversionMode m_dsdConversionMode{DirettaRingBuffer::DSDConversionMode::Passthrough};
 
     // Prefill and stabilization
     size_t m_prefillTarget = 0;

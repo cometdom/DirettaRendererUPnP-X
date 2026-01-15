@@ -18,7 +18,15 @@
 #include <cstdlib>
 #include <new>
 #include <type_traits>
-#include <immintrin.h>
+
+// Architecture detection for SIMD support
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #define DIRETTA_HAS_AVX2 1
+    #include <immintrin.h>
+#else
+    #define DIRETTA_HAS_AVX2 0
+#endif
+
 #include "memcpyfast_audio.h"
 
 template <typename T, size_t Alignment>
@@ -92,6 +100,15 @@ bool operator!=(const AlignedAllocator<T, Alignment>&, const AlignedAllocator<T,
  */
 class DirettaRingBuffer {
 public:
+    // DSD conversion mode - determined at track open, eliminates per-iteration branch checks
+    // Declared early so it can be used in method signatures
+    enum class DSDConversionMode {
+        Passthrough,       // Just interleave (DSF→LSB target or DFF→MSB target) - fastest
+        BitReverseOnly,    // DSF→MSB or DFF→LSB target
+        ByteSwapOnly,      // Endianness conversion only
+        BitReverseAndSwap  // Both operations needed
+    };
+
     DirettaRingBuffer() = default;
 
     /**
@@ -102,9 +119,8 @@ public:
         mask_ = size_ - 1;
         buffer_.resize(size_);
         silenceByte_.store(silenceByte, std::memory_order_release);
-        clear();
+        clear();  // Resets all S24 state - hint will be set by caller via setS24PackModeHint()
         fillWithSilence();
-        m_s24PackMode = S24PackMode::Unknown;
     }
 
     size_t size() const { return size_; }
@@ -131,7 +147,12 @@ public:
     void clear() {
         writePos_.store(0, std::memory_order_release);
         readPos_.store(0, std::memory_order_release);
+        // Reset all S24 state to allow fresh detection for new tracks
+        // New track will set hint via setS24PackModeHint() if available
         m_s24PackMode = S24PackMode::Unknown;
+        m_s24Hint = S24PackMode::Unknown;
+        m_s24DetectionConfirmed = false;
+        m_deferredSampleCount = 0;
     }
 
     void fillWithSilence() {
@@ -170,6 +191,11 @@ public:
     /**
      * @brief Push with 24-bit packing (4 bytes in -> 3 bytes out, S24_P32 format)
      * @return Input bytes consumed
+     *
+     * Uses hybrid S24 detection:
+     * 1. Sample-based detection takes priority (checks actual byte values)
+     * 2. Hint from FFmpeg metadata used as fallback for silence
+     * 3. Timeout defaults to LSB after ~1 second of silence
      */
     size_t push24BitPacked(const uint8_t* data, size_t inputSize) {
         if (size_ == 0) return 0;
@@ -186,11 +212,34 @@ public:
 
         prefetch_audio_buffer(data, numSamples * 4);
 
-        if (m_s24PackMode == S24PackMode::Unknown) {
-            m_s24PackMode = detectS24PackMode(data, numSamples);
+        // Hybrid S24 detection - sample detection can override hints
+        // Always run detection when Unknown/Deferred, or when hint was applied but not confirmed
+        if (m_s24PackMode == S24PackMode::Unknown || m_s24PackMode == S24PackMode::Deferred ||
+            (m_s24PackMode == m_s24Hint && !m_s24DetectionConfirmed)) {
+            S24PackMode detected = detectS24PackMode(data, numSamples);
+            if (detected != S24PackMode::Deferred) {
+                // Sample detection found definitive result - use it
+                m_s24PackMode = detected;
+                m_s24DetectionConfirmed = true;
+                m_deferredSampleCount = 0;
+            } else {
+                // Still silence - accumulate count for timeout
+                m_deferredSampleCount += numSamples;
+                // Timeout: if still silent after threshold, use hint or default to LSB
+                if (m_deferredSampleCount > DEFERRED_TIMEOUT_SAMPLES) {
+                    m_s24PackMode = (m_s24Hint != S24PackMode::Unknown) ? m_s24Hint : S24PackMode::LsbAligned;
+                    m_s24DetectionConfirmed = true;
+                }
+            }
         }
 
-        size_t stagedBytes = (m_s24PackMode == S24PackMode::MsbAligned)
+        // Use effective mode for conversion (Deferred/Unknown use hint or LSB as fallback)
+        S24PackMode effectiveMode = m_s24PackMode;
+        if (effectiveMode == S24PackMode::Deferred || effectiveMode == S24PackMode::Unknown) {
+            effectiveMode = (m_s24Hint != S24PackMode::Unknown) ? m_s24Hint : S24PackMode::LsbAligned;
+        }
+
+        size_t stagedBytes = (effectiveMode == S24PackMode::MsbAligned)
             ? convert24BitPackedShifted_AVX2(m_staging24BitPack, data, numSamples)
             : convert24BitPacked_AVX2(m_staging24BitPack, data, numSamples);
         size_t written = writeToRing(m_staging24BitPack, stagedBytes);
@@ -262,6 +311,63 @@ public:
         return written;
     }
 
+    /**
+     * @brief Optimized DSD planar push using pre-selected conversion mode
+     *
+     * Uses specialized conversion functions with no per-iteration branch checks.
+     * Mode should be determined at track open and cached in DirettaSync.
+     *
+     * @param data Planar DSD data
+     * @param inputSize Total input size in bytes
+     * @param numChannels Number of audio channels
+     * @param mode Pre-selected conversion mode (eliminates runtime checks)
+     * @return Input bytes consumed
+     */
+    size_t pushDSDPlanarOptimized(const uint8_t* data, size_t inputSize,
+                                   int numChannels, DSDConversionMode mode) {
+        if (size_ == 0) return 0;
+        if (numChannels == 0) return 0;
+
+        size_t maxBytes = inputSize;
+        if (maxBytes > STAGING_SIZE) maxBytes = STAGING_SIZE;
+        size_t free = getFreeSpace();
+        if (maxBytes > free) maxBytes = free;
+
+        size_t bytesPerChannel = maxBytes / static_cast<size_t>(numChannels);
+        size_t completeGroups = bytesPerChannel / 4;
+        size_t usableInput = completeGroups * 4 * static_cast<size_t>(numChannels);
+        if (usableInput == 0) return 0;
+
+        prefetch_audio_buffer(data, usableInput);
+
+        size_t stagedBytes;
+        switch (mode) {
+            case DSDConversionMode::Passthrough:
+                stagedBytes = convertDSD_Passthrough(m_stagingDSD, data, usableInput, numChannels);
+                break;
+            case DSDConversionMode::BitReverseOnly:
+                stagedBytes = convertDSD_BitReverse(m_stagingDSD, data, usableInput, numChannels);
+                break;
+            case DSDConversionMode::ByteSwapOnly:
+                stagedBytes = convertDSD_ByteSwap(m_stagingDSD, data, usableInput, numChannels);
+                break;
+            case DSDConversionMode::BitReverseAndSwap:
+                stagedBytes = convertDSD_BitReverseSwap(m_stagingDSD, data, usableInput, numChannels);
+                break;
+            default:
+                // Fallback to passthrough if unknown mode
+                stagedBytes = convertDSD_Passthrough(m_stagingDSD, data, usableInput, numChannels);
+                break;
+        }
+
+        return writeToRing(m_stagingDSD, stagedBytes);
+    }
+
+    //=========================================================================
+    // Format conversion functions - with AVX2 optimization on x86
+    //=========================================================================
+
+#if DIRETTA_HAS_AVX2
     /**
      * Convert S24_P32 to packed 24-bit using AVX2
      * Input: 4 bytes per sample (24-bit in 32-bit container)
@@ -394,11 +500,405 @@ public:
         return outputBytes;
     }
 
+#else // !DIRETTA_HAS_AVX2 - Scalar implementations for ARM64 and other architectures
+
     /**
-     * Convert DSD planar to interleaved using AVX2 (stereo only)
+     * Convert S24_P32 to packed 24-bit (scalar version)
+     */
+    size_t convert24BitPacked_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+        size_t outputBytes = 0;
+        for (size_t i = 0; i < numSamples; i++) {
+            dst[outputBytes + 0] = src[i * 4 + 0];
+            dst[outputBytes + 1] = src[i * 4 + 1];
+            dst[outputBytes + 2] = src[i * 4 + 2];
+            outputBytes += 3;
+        }
+        return outputBytes;
+    }
+
+    size_t convert24BitPackedShifted_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+        size_t outputBytes = 0;
+        for (size_t i = 0; i < numSamples; i++) {
+            dst[outputBytes + 0] = src[i * 4 + 1];
+            dst[outputBytes + 1] = src[i * 4 + 2];
+            dst[outputBytes + 2] = src[i * 4 + 3];
+            outputBytes += 3;
+        }
+        return outputBytes;
+    }
+
+    /**
+     * Convert 16-bit to 32-bit (scalar version)
+     */
+    size_t convert16To32_AVX2(uint8_t* dst, const uint8_t* src, size_t numSamples) {
+        size_t outputBytes = 0;
+        for (size_t i = 0; i < numSamples; i++) {
+            dst[outputBytes + 0] = 0x00;
+            dst[outputBytes + 1] = 0x00;
+            dst[outputBytes + 2] = src[i * 2 + 0];
+            dst[outputBytes + 3] = src[i * 2 + 1];
+            outputBytes += 4;
+        }
+        return outputBytes;
+    }
+
+#endif // DIRETTA_HAS_AVX2
+
+    //=========================================================================
+    // Specialized DSD conversion functions - no per-iteration branch checks
+    // Mode is determined at track open, eliminating runtime conditionals
+    //=========================================================================
+
+    /**
+     * DSD Passthrough: Just interleave channels (fastest path)
+     * Used when source bit ordering matches target (DSF→LSB or DFF→MSB)
+     * NO bit reversal, NO byte swap
+     */
+    size_t convertDSD_Passthrough(uint8_t* dst, const uint8_t* src,
+                                   size_t totalInputBytes, int numChannels) {
+        size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
+        size_t outputBytes = 0;
+
+#if DIRETTA_HAS_AVX2
+        if (numChannels == 2) {
+            const uint8_t* srcL = src;
+            const uint8_t* srcR = src + bytesPerChannel;
+
+            size_t i = 0;
+            for (; i + 32 <= bytesPerChannel; i += 32) {
+                __m256i left = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcL + i));
+                __m256i right = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcR + i));
+
+                // NO bit reversal - passthrough
+                // NO byte swap - passthrough
+
+                __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+                __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+
+                __m256i out0 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x31);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out0);
+                outputBytes += 32;
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out1);
+                outputBytes += 32;
+            }
+
+            // Scalar tail - no branches
+            for (; i + 4 <= bytesPerChannel; i += 4) {
+                dst[outputBytes++] = srcL[i + 0];
+                dst[outputBytes++] = srcL[i + 1];
+                dst[outputBytes++] = srcL[i + 2];
+                dst[outputBytes++] = srcL[i + 3];
+                dst[outputBytes++] = srcR[i + 0];
+                dst[outputBytes++] = srcR[i + 1];
+                dst[outputBytes++] = srcR[i + 2];
+                dst[outputBytes++] = srcR[i + 3];
+            }
+
+            _mm256_zeroupper();
+            return outputBytes;
+        }
+#endif
+        // Scalar fallback for non-AVX2 or non-stereo
+        for (size_t i = 0; i < bytesPerChannel; i += 4) {
+            for (int ch = 0; ch < numChannels; ch++) {
+                size_t chOffset = static_cast<size_t>(ch) * bytesPerChannel;
+                dst[outputBytes++] = src[chOffset + i + 0];
+                dst[outputBytes++] = src[chOffset + i + 1];
+                dst[outputBytes++] = src[chOffset + i + 2];
+                dst[outputBytes++] = src[chOffset + i + 3];
+            }
+        }
+        return outputBytes;
+    }
+
+    /**
+     * DSD BitReverse: Apply bit reversal only (no byte swap)
+     * Used for DSF→MSB or DFF→LSB target conversions
+     */
+    size_t convertDSD_BitReverse(uint8_t* dst, const uint8_t* src,
+                                  size_t totalInputBytes, int numChannels) {
+        size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
+        size_t outputBytes = 0;
+
+#if DIRETTA_HAS_AVX2
+        if (numChannels == 2) {
+            const uint8_t* srcL = src;
+            const uint8_t* srcR = src + bytesPerChannel;
+
+            size_t i = 0;
+            for (; i + 32 <= bytesPerChannel; i += 32) {
+                __m256i left = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcL + i));
+                __m256i right = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcR + i));
+
+                // ALWAYS apply bit reversal
+                left = simd_bit_reverse(left);
+                right = simd_bit_reverse(right);
+
+                // NO byte swap
+
+                __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+                __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+
+                __m256i out0 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x31);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out0);
+                outputBytes += 32;
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out1);
+                outputBytes += 32;
+            }
+
+            // Scalar tail with bit reversal lookup
+            static const uint8_t bitReverseLUT[256] = {
+                0x00,0x80,0x40,0xC0,0x20,0xA0,0x60,0xE0,0x10,0x90,0x50,0xD0,0x30,0xB0,0x70,0xF0,
+                0x08,0x88,0x48,0xC8,0x28,0xA8,0x68,0xE8,0x18,0x98,0x58,0xD8,0x38,0xB8,0x78,0xF8,
+                0x04,0x84,0x44,0xC4,0x24,0xA4,0x64,0xE4,0x14,0x94,0x54,0xD4,0x34,0xB4,0x74,0xF4,
+                0x0C,0x8C,0x4C,0xCC,0x2C,0xAC,0x6C,0xEC,0x1C,0x9C,0x5C,0xDC,0x3C,0xBC,0x7C,0xFC,
+                0x02,0x82,0x42,0xC2,0x22,0xA2,0x62,0xE2,0x12,0x92,0x52,0xD2,0x32,0xB2,0x72,0xF2,
+                0x0A,0x8A,0x4A,0xCA,0x2A,0xAA,0x6A,0xEA,0x1A,0x9A,0x5A,0xDA,0x3A,0xBA,0x7A,0xFA,
+                0x06,0x86,0x46,0xC6,0x26,0xA6,0x66,0xE6,0x16,0x96,0x56,0xD6,0x36,0xB6,0x76,0xF6,
+                0x0E,0x8E,0x4E,0xCE,0x2E,0xAE,0x6E,0xEE,0x1E,0x9E,0x5E,0xDE,0x3E,0xBE,0x7E,0xFE,
+                0x01,0x81,0x41,0xC1,0x21,0xA1,0x61,0xE1,0x11,0x91,0x51,0xD1,0x31,0xB1,0x71,0xF1,
+                0x09,0x89,0x49,0xC9,0x29,0xA9,0x69,0xE9,0x19,0x99,0x59,0xD9,0x39,0xB9,0x79,0xF9,
+                0x05,0x85,0x45,0xC5,0x25,0xA5,0x65,0xE5,0x15,0x95,0x55,0xD5,0x35,0xB5,0x75,0xF5,
+                0x0D,0x8D,0x4D,0xCD,0x2D,0xAD,0x6D,0xED,0x1D,0x9D,0x5D,0xDD,0x3D,0xBD,0x7D,0xFD,
+                0x03,0x83,0x43,0xC3,0x23,0xA3,0x63,0xE3,0x13,0x93,0x53,0xD3,0x33,0xB3,0x73,0xF3,
+                0x0B,0x8B,0x4B,0xCB,0x2B,0xAB,0x6B,0xEB,0x1B,0x9B,0x5B,0xDB,0x3B,0xBB,0x7B,0xFB,
+                0x07,0x87,0x47,0xC7,0x27,0xA7,0x67,0xE7,0x17,0x97,0x57,0xD7,0x37,0xB7,0x77,0xF7,
+                0x0F,0x8F,0x4F,0xCF,0x2F,0xAF,0x6F,0xEF,0x1F,0x9F,0x5F,0xDF,0x3F,0xBF,0x7F,0xFF
+            };
+            for (; i + 4 <= bytesPerChannel; i += 4) {
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 0]];
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 1]];
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 2]];
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 3]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 0]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 1]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 2]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 3]];
+            }
+
+            _mm256_zeroupper();
+            return outputBytes;
+        }
+#endif
+        // Scalar fallback with bit reversal
+        static const uint8_t bitReverseLUT[256] = {
+            0x00,0x80,0x40,0xC0,0x20,0xA0,0x60,0xE0,0x10,0x90,0x50,0xD0,0x30,0xB0,0x70,0xF0,
+            0x08,0x88,0x48,0xC8,0x28,0xA8,0x68,0xE8,0x18,0x98,0x58,0xD8,0x38,0xB8,0x78,0xF8,
+            0x04,0x84,0x44,0xC4,0x24,0xA4,0x64,0xE4,0x14,0x94,0x54,0xD4,0x34,0xB4,0x74,0xF4,
+            0x0C,0x8C,0x4C,0xCC,0x2C,0xAC,0x6C,0xEC,0x1C,0x9C,0x5C,0xDC,0x3C,0xBC,0x7C,0xFC,
+            0x02,0x82,0x42,0xC2,0x22,0xA2,0x62,0xE2,0x12,0x92,0x52,0xD2,0x32,0xB2,0x72,0xF2,
+            0x0A,0x8A,0x4A,0xCA,0x2A,0xAA,0x6A,0xEA,0x1A,0x9A,0x5A,0xDA,0x3A,0xBA,0x7A,0xFA,
+            0x06,0x86,0x46,0xC6,0x26,0xA6,0x66,0xE6,0x16,0x96,0x56,0xD6,0x36,0xB6,0x76,0xF6,
+            0x0E,0x8E,0x4E,0xCE,0x2E,0xAE,0x6E,0xEE,0x1E,0x9E,0x5E,0xDE,0x3E,0xBE,0x7E,0xFE,
+            0x01,0x81,0x41,0xC1,0x21,0xA1,0x61,0xE1,0x11,0x91,0x51,0xD1,0x31,0xB1,0x71,0xF1,
+            0x09,0x89,0x49,0xC9,0x29,0xA9,0x69,0xE9,0x19,0x99,0x59,0xD9,0x39,0xB9,0x79,0xF9,
+            0x05,0x85,0x45,0xC5,0x25,0xA5,0x65,0xE5,0x15,0x95,0x55,0xD5,0x35,0xB5,0x75,0xF5,
+            0x0D,0x8D,0x4D,0xCD,0x2D,0xAD,0x6D,0xED,0x1D,0x9D,0x5D,0xDD,0x3D,0xBD,0x7D,0xFD,
+            0x03,0x83,0x43,0xC3,0x23,0xA3,0x63,0xE3,0x13,0x93,0x53,0xD3,0x33,0xB3,0x73,0xF3,
+            0x0B,0x8B,0x4B,0xCB,0x2B,0xAB,0x6B,0xEB,0x1B,0x9B,0x5B,0xDB,0x3B,0xBB,0x7B,0xFB,
+            0x07,0x87,0x47,0xC7,0x27,0xA7,0x67,0xE7,0x17,0x97,0x57,0xD7,0x37,0xB7,0x77,0xF7,
+            0x0F,0x8F,0x4F,0xCF,0x2F,0xAF,0x6F,0xEF,0x1F,0x9F,0x5F,0xDF,0x3F,0xBF,0x7F,0xFF
+        };
+        for (size_t i = 0; i < bytesPerChannel; i += 4) {
+            for (int ch = 0; ch < numChannels; ch++) {
+                size_t chOffset = static_cast<size_t>(ch) * bytesPerChannel;
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 0]];
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 1]];
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 2]];
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 3]];
+            }
+        }
+        return outputBytes;
+    }
+
+    /**
+     * DSD ByteSwap: Apply byte swap only (no bit reversal)
+     * Used for endianness conversion
+     */
+    size_t convertDSD_ByteSwap(uint8_t* dst, const uint8_t* src,
+                                size_t totalInputBytes, int numChannels) {
+        size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
+        size_t outputBytes = 0;
+
+#if DIRETTA_HAS_AVX2
+        if (numChannels == 2) {
+            const uint8_t* srcL = src;
+            const uint8_t* srcR = src + bytesPerChannel;
+
+            static const __m256i byteswap_mask = _mm256_setr_epi8(
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12
+            );
+
+            size_t i = 0;
+            for (; i + 32 <= bytesPerChannel; i += 32) {
+                __m256i left = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcL + i));
+                __m256i right = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcR + i));
+
+                // NO bit reversal
+
+                __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+                __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+
+                // ALWAYS apply byte swap
+                interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
+                interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+
+                __m256i out0 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x31);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out0);
+                outputBytes += 32;
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out1);
+                outputBytes += 32;
+            }
+
+            // Scalar tail with byte swap
+            for (; i + 4 <= bytesPerChannel; i += 4) {
+                dst[outputBytes++] = srcL[i + 3];
+                dst[outputBytes++] = srcL[i + 2];
+                dst[outputBytes++] = srcL[i + 1];
+                dst[outputBytes++] = srcL[i + 0];
+                dst[outputBytes++] = srcR[i + 3];
+                dst[outputBytes++] = srcR[i + 2];
+                dst[outputBytes++] = srcR[i + 1];
+                dst[outputBytes++] = srcR[i + 0];
+            }
+
+            _mm256_zeroupper();
+            return outputBytes;
+        }
+#endif
+        // Scalar fallback with byte swap
+        for (size_t i = 0; i < bytesPerChannel; i += 4) {
+            for (int ch = 0; ch < numChannels; ch++) {
+                size_t chOffset = static_cast<size_t>(ch) * bytesPerChannel;
+                dst[outputBytes++] = src[chOffset + i + 3];
+                dst[outputBytes++] = src[chOffset + i + 2];
+                dst[outputBytes++] = src[chOffset + i + 1];
+                dst[outputBytes++] = src[chOffset + i + 0];
+            }
+        }
+        return outputBytes;
+    }
+
+    /**
+     * DSD BitReverse + ByteSwap: Apply both operations
+     * Used when both bit reversal and endianness conversion are needed
+     */
+    size_t convertDSD_BitReverseSwap(uint8_t* dst, const uint8_t* src,
+                                      size_t totalInputBytes, int numChannels) {
+        size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
+        size_t outputBytes = 0;
+
+#if DIRETTA_HAS_AVX2
+        if (numChannels == 2) {
+            const uint8_t* srcL = src;
+            const uint8_t* srcR = src + bytesPerChannel;
+
+            static const __m256i byteswap_mask = _mm256_setr_epi8(
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+                3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12
+            );
+
+            size_t i = 0;
+            for (; i + 32 <= bytesPerChannel; i += 32) {
+                __m256i left = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcL + i));
+                __m256i right = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(srcR + i));
+
+                // ALWAYS apply bit reversal
+                left = simd_bit_reverse(left);
+                right = simd_bit_reverse(right);
+
+                __m256i interleaved_lo = _mm256_unpacklo_epi32(left, right);
+                __m256i interleaved_hi = _mm256_unpackhi_epi32(left, right);
+
+                // ALWAYS apply byte swap
+                interleaved_lo = _mm256_shuffle_epi8(interleaved_lo, byteswap_mask);
+                interleaved_hi = _mm256_shuffle_epi8(interleaved_hi, byteswap_mask);
+
+                __m256i out0 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x20);
+                __m256i out1 = _mm256_permute2x128_si256(interleaved_lo, interleaved_hi, 0x31);
+
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out0);
+                outputBytes += 32;
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + outputBytes), out1);
+                outputBytes += 32;
+            }
+
+            // Scalar tail with bit reversal + byte swap
+            static const uint8_t bitReverseLUT[256] = {
+                0x00,0x80,0x40,0xC0,0x20,0xA0,0x60,0xE0,0x10,0x90,0x50,0xD0,0x30,0xB0,0x70,0xF0,
+                0x08,0x88,0x48,0xC8,0x28,0xA8,0x68,0xE8,0x18,0x98,0x58,0xD8,0x38,0xB8,0x78,0xF8,
+                0x04,0x84,0x44,0xC4,0x24,0xA4,0x64,0xE4,0x14,0x94,0x54,0xD4,0x34,0xB4,0x74,0xF4,
+                0x0C,0x8C,0x4C,0xCC,0x2C,0xAC,0x6C,0xEC,0x1C,0x9C,0x5C,0xDC,0x3C,0xBC,0x7C,0xFC,
+                0x02,0x82,0x42,0xC2,0x22,0xA2,0x62,0xE2,0x12,0x92,0x52,0xD2,0x32,0xB2,0x72,0xF2,
+                0x0A,0x8A,0x4A,0xCA,0x2A,0xAA,0x6A,0xEA,0x1A,0x9A,0x5A,0xDA,0x3A,0xBA,0x7A,0xFA,
+                0x06,0x86,0x46,0xC6,0x26,0xA6,0x66,0xE6,0x16,0x96,0x56,0xD6,0x36,0xB6,0x76,0xF6,
+                0x0E,0x8E,0x4E,0xCE,0x2E,0xAE,0x6E,0xEE,0x1E,0x9E,0x5E,0xDE,0x3E,0xBE,0x7E,0xFE,
+                0x01,0x81,0x41,0xC1,0x21,0xA1,0x61,0xE1,0x11,0x91,0x51,0xD1,0x31,0xB1,0x71,0xF1,
+                0x09,0x89,0x49,0xC9,0x29,0xA9,0x69,0xE9,0x19,0x99,0x59,0xD9,0x39,0xB9,0x79,0xF9,
+                0x05,0x85,0x45,0xC5,0x25,0xA5,0x65,0xE5,0x15,0x95,0x55,0xD5,0x35,0xB5,0x75,0xF5,
+                0x0D,0x8D,0x4D,0xCD,0x2D,0xAD,0x6D,0xED,0x1D,0x9D,0x5D,0xDD,0x3D,0xBD,0x7D,0xFD,
+                0x03,0x83,0x43,0xC3,0x23,0xA3,0x63,0xE3,0x13,0x93,0x53,0xD3,0x33,0xB3,0x73,0xF3,
+                0x0B,0x8B,0x4B,0xCB,0x2B,0xAB,0x6B,0xEB,0x1B,0x9B,0x5B,0xDB,0x3B,0xBB,0x7B,0xFB,
+                0x07,0x87,0x47,0xC7,0x27,0xA7,0x67,0xE7,0x17,0x97,0x57,0xD7,0x37,0xB7,0x77,0xF7,
+                0x0F,0x8F,0x4F,0xCF,0x2F,0xAF,0x6F,0xEF,0x1F,0x9F,0x5F,0xDF,0x3F,0xBF,0x7F,0xFF
+            };
+            for (; i + 4 <= bytesPerChannel; i += 4) {
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 3]];
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 2]];
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 1]];
+                dst[outputBytes++] = bitReverseLUT[srcL[i + 0]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 3]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 2]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 1]];
+                dst[outputBytes++] = bitReverseLUT[srcR[i + 0]];
+            }
+
+            _mm256_zeroupper();
+            return outputBytes;
+        }
+#endif
+        // Scalar fallback with bit reversal + byte swap
+        static const uint8_t bitReverseLUT[256] = {
+            0x00,0x80,0x40,0xC0,0x20,0xA0,0x60,0xE0,0x10,0x90,0x50,0xD0,0x30,0xB0,0x70,0xF0,
+            0x08,0x88,0x48,0xC8,0x28,0xA8,0x68,0xE8,0x18,0x98,0x58,0xD8,0x38,0xB8,0x78,0xF8,
+            0x04,0x84,0x44,0xC4,0x24,0xA4,0x64,0xE4,0x14,0x94,0x54,0xD4,0x34,0xB4,0x74,0xF4,
+            0x0C,0x8C,0x4C,0xCC,0x2C,0xAC,0x6C,0xEC,0x1C,0x9C,0x5C,0xDC,0x3C,0xBC,0x7C,0xFC,
+            0x02,0x82,0x42,0xC2,0x22,0xA2,0x62,0xE2,0x12,0x92,0x52,0xD2,0x32,0xB2,0x72,0xF2,
+            0x0A,0x8A,0x4A,0xCA,0x2A,0xAA,0x6A,0xEA,0x1A,0x9A,0x5A,0xDA,0x3A,0xBA,0x7A,0xFA,
+            0x06,0x86,0x46,0xC6,0x26,0xA6,0x66,0xE6,0x16,0x96,0x56,0xD6,0x36,0xB6,0x76,0xF6,
+            0x0E,0x8E,0x4E,0xCE,0x2E,0xAE,0x6E,0xEE,0x1E,0x9E,0x5E,0xDE,0x3E,0xBE,0x7E,0xFE,
+            0x01,0x81,0x41,0xC1,0x21,0xA1,0x61,0xE1,0x11,0x91,0x51,0xD1,0x31,0xB1,0x71,0xF1,
+            0x09,0x89,0x49,0xC9,0x29,0xA9,0x69,0xE9,0x19,0x99,0x59,0xD9,0x39,0xB9,0x79,0xF9,
+            0x05,0x85,0x45,0xC5,0x25,0xA5,0x65,0xE5,0x15,0x95,0x55,0xD5,0x35,0xB5,0x75,0xF5,
+            0x0D,0x8D,0x4D,0xCD,0x2D,0xAD,0x6D,0xED,0x1D,0x9D,0x5D,0xDD,0x3D,0xBD,0x7D,0xFD,
+            0x03,0x83,0x43,0xC3,0x23,0xA3,0x63,0xE3,0x13,0x93,0x53,0xD3,0x33,0xB3,0x73,0xF3,
+            0x0B,0x8B,0x4B,0xCB,0x2B,0xAB,0x6B,0xEB,0x1B,0x9B,0x5B,0xDB,0x3B,0xBB,0x7B,0xFB,
+            0x07,0x87,0x47,0xC7,0x27,0xA7,0x67,0xE7,0x17,0x97,0x57,0xD7,0x37,0xB7,0x77,0xF7,
+            0x0F,0x8F,0x4F,0xCF,0x2F,0xAF,0x6F,0xEF,0x1F,0x9F,0x5F,0xDF,0x3F,0xBF,0x7F,0xFF
+        };
+        for (size_t i = 0; i < bytesPerChannel; i += 4) {
+            for (int ch = 0; ch < numChannels; ch++) {
+                size_t chOffset = static_cast<size_t>(ch) * bytesPerChannel;
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 3]];
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 2]];
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 1]];
+                dst[outputBytes++] = bitReverseLUT[src[chOffset + i + 0]];
+            }
+        }
+        return outputBytes;
+    }
+
+    /**
+     * Convert DSD planar to interleaved
      * Input: [L channel bytes][R channel bytes] planar
      * Output: [4B L][4B R][4B L][4B R]... interleaved
-     * Falls back to scalar for non-stereo
      */
     size_t convertDSDPlanar_AVX2(
         uint8_t* dst,
@@ -411,6 +911,7 @@ public:
         size_t bytesPerChannel = totalInputBytes / static_cast<size_t>(numChannels);
         size_t outputBytes = 0;
 
+#if DIRETTA_HAS_AVX2
         if (numChannels == 2) {
             const uint8_t* srcL = src;
             const uint8_t* srcR = src + bytesPerChannel;
@@ -447,15 +948,14 @@ public:
                 outputBytes += 32;
             }
 
+            // Scalar tail for remaining bytes
             for (; i + 4 <= bytesPerChannel; i += 4) {
-                // Left channel - collect 4 bytes
                 uint8_t groupL[4];
                 for (int j = 0; j < 4; j++) {
                     uint8_t b = srcL[i + j];
                     if (bitReversalTable) b = bitReversalTable[b];
                     groupL[j] = b;
                 }
-                // Write with byte swap if needed
                 if (needByteSwap) {
                     dst[outputBytes++] = groupL[3];
                     dst[outputBytes++] = groupL[2];
@@ -468,14 +968,12 @@ public:
                     dst[outputBytes++] = groupL[3];
                 }
 
-                // Right channel - collect 4 bytes
                 uint8_t groupR[4];
                 for (int j = 0; j < 4; j++) {
                     uint8_t b = srcR[i + j];
                     if (bitReversalTable) b = bitReversalTable[b];
                     groupR[j] = b;
                 }
-                // Write with byte swap if needed
                 if (needByteSwap) {
                     dst[outputBytes++] = groupR[3];
                     dst[outputBytes++] = groupR[2];
@@ -494,6 +992,11 @@ public:
             outputBytes = convertDSDPlanar_Scalar(dst, src, totalInputBytes, numChannels,
                                                   bitReversalTable, needByteSwap);
         }
+#else
+        // Pure scalar implementation for ARM64 and other architectures
+        outputBytes = convertDSDPlanar_Scalar(dst, src, totalInputBytes, numChannels,
+                                              bitReversalTable, needByteSwap);
+#endif
 
         return outputBytes;
     }
@@ -608,6 +1111,7 @@ private:
         return outputBytes;
     }
 
+#if DIRETTA_HAS_AVX2
     static __m256i simd_bit_reverse(__m256i x) {
         static const __m256i nibble_reverse = _mm256_setr_epi8(
             0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
@@ -625,6 +1129,7 @@ private:
 
         return _mm256_or_si256(_mm256_slli_epi16(lo_reversed, 4), hi_reversed);
     }
+#endif // DIRETTA_HAS_AVX2
 
     static size_t roundUpPow2(size_t value) {
         if (value < 2) {
@@ -651,17 +1156,68 @@ private:
     alignas(64) std::atomic<size_t> readPos_{0};
     std::atomic<uint8_t> silenceByte_{0};
 
-    enum class S24PackMode { Unknown, LsbAligned, MsbAligned };
-    S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) const {
-        size_t checkSamples = std::min<size_t>(numSamples, 32);
-        for (size_t i = 0; i < checkSamples; i++) {
-            if (data[i * 4] != 0x00) {
-                return S24PackMode::LsbAligned;
-            }
+public:
+    // S24 pack mode detection - determines byte alignment of 24-bit samples in 32-bit containers
+    enum class S24PackMode { Unknown, LsbAligned, MsbAligned, Deferred };
+
+    /**
+     * @brief Set S24 pack mode hint from FFmpeg metadata
+     *
+     * Call this when track info indicates 24-bit content. The hint is used as fallback
+     * when sample-based detection sees all-zero data (silence at track start).
+     * Sample-based detection takes priority when non-zero samples are present.
+     */
+    void setS24PackModeHint(S24PackMode hint) {
+        // Store hint separately - sample detection can override
+        m_s24Hint = hint;
+        // Reset confirmation so detection runs again with new hint
+        m_s24DetectionConfirmed = false;
+        // Apply hint immediately only if no mode detected yet
+        if (m_s24PackMode == S24PackMode::Unknown || m_s24PackMode == S24PackMode::Deferred) {
+            m_s24PackMode = hint;
         }
-        return S24PackMode::MsbAligned;
     }
+
+    S24PackMode getS24PackMode() const { return m_s24PackMode; }
+    S24PackMode getS24Hint() const { return m_s24Hint; }
+
+private:
+    /**
+     * Detect S24 pack mode by examining sample data
+     *
+     * Checks both LSB (byte 0) and MSB (byte 3) positions:
+     * - LSB-aligned: data in bytes 0-2, byte 3 is zero (standard S24_LE)
+     * - MSB-aligned: data in bytes 1-3, byte 0 is zero (left-justified)
+     * - Deferred: all samples are zero (silence) - cannot determine
+     */
+    S24PackMode detectS24PackMode(const uint8_t* data, size_t numSamples) const {
+        size_t checkSamples = std::min<size_t>(numSamples, 64);
+        bool allZeroLSB = true;
+        bool allZeroMSB = true;
+
+        for (size_t i = 0; i < checkSamples; i++) {
+            uint8_t b0 = data[i * 4];       // LSB position
+            uint8_t b3 = data[i * 4 + 3];   // MSB position
+            if (b0 != 0x00) allZeroLSB = false;
+            if (b3 != 0x00) allZeroMSB = false;
+        }
+
+        if (!allZeroLSB && allZeroMSB) {
+            return S24PackMode::LsbAligned;  // Data in LSB, MSB is padding
+        } else if (allZeroLSB && !allZeroMSB) {
+            return S24PackMode::MsbAligned;  // Data in MSB, LSB is padding
+        } else if (allZeroLSB && allZeroMSB) {
+            return S24PackMode::Deferred;    // Silence - can't determine yet
+        }
+        // Both non-zero - ambiguous, default to LSB (more common)
+        return S24PackMode::LsbAligned;
+    }
+
     S24PackMode m_s24PackMode = S24PackMode::Unknown;
+    S24PackMode m_s24Hint = S24PackMode::Unknown;
+    bool m_s24DetectionConfirmed = false;
+    size_t m_deferredSampleCount = 0;
+    static constexpr size_t DEFERRED_TIMEOUT_SAMPLES = 48000;  // ~1 second at 48kHz
 };
 
 #endif // DIRETTA_RING_BUFFER_H

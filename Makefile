@@ -178,8 +178,45 @@ $(info )
 # Paths and Libraries
 # ============================================
 
+# FFmpeg path override (for ABI compatibility with target system)
+# Usage: make FFMPEG_PATH=/path/to/ffmpeg-headers
+#
+# This is critical for avoiding crashes when compile-time headers
+# don't match runtime library version (e.g., compiling against
+# FFmpeg 7.x headers but running against FFmpeg 5.x libraries)
+
+# Auto-detect local FFmpeg headers (downloaded by install.sh)
+FFMPEG_HEADERS_LOCAL = $(wildcard ./ffmpeg-headers/.version)
+
+ifdef FFMPEG_PATH
+    # Explicit path provided
+    FFMPEG_INCLUDES = -I$(FFMPEG_PATH)
+    FFMPEG_LDFLAGS =
+    $(info FFmpeg headers: $(FFMPEG_PATH) (explicit))
+else ifneq ($(FFMPEG_HEADERS_LOCAL),)
+    # Local ffmpeg-headers directory exists (from install.sh)
+    FFMPEG_PATH = ./ffmpeg-headers
+    FFMPEG_INCLUDES = -I$(FFMPEG_PATH)
+    FFMPEG_LDFLAGS =
+    FFMPEG_LOCAL_VER := $(shell cat ./ffmpeg-headers/.version 2>/dev/null)
+    $(info FFmpeg headers: ./ffmpeg-headers (v$(FFMPEG_LOCAL_VER)))
+else
+    # Fall back to system headers
+    FFMPEG_INCLUDES = -I/usr/include/ffmpeg -I/usr/include
+    FFMPEG_LDFLAGS =
+    $(info FFmpeg headers: system (/usr/include))
+    $(info )
+    $(info ╔══════════════════════════════════════════════════════════════════╗)
+    $(info ║ NOTE: Using system FFmpeg headers. If you experience crashes,    ║)
+    $(info ║ ensure headers match your runtime FFmpeg version, or run:        ║)
+    $(info ║   make FFMPEG_PATH=/path/to/ffmpeg-source                        ║)
+    $(info ║ Or use install.sh which auto-downloads matching headers.         ║)
+    $(info ╚══════════════════════════════════════════════════════════════════╝)
+    $(info )
+endif
+
 INCLUDES = \
-    -I/usr/include/ffmpeg \
+    $(FFMPEG_INCLUDES) \
     -I/usr/include/upnp \
     -I/usr/local/include \
     -I. \
@@ -187,6 +224,7 @@ INCLUDES = \
     -I$(SDK_PATH)/Host
 
 LDFLAGS += \
+    $(FFMPEG_LDFLAGS) \
     -L/usr/local/lib \
     -L$(SDK_PATH)/lib
 

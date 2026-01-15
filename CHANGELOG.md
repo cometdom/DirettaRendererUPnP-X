@@ -1,6 +1,259 @@
 # Changelog
 
+## 2026-01-15 (Session 2)
+
+### PCM FIFO and Bypass Optimization (thanks to @leeeanh)
+
+Four interconnected optimizations to the PCM audio path, adapted from the leeeanh fork optimization designs with preservation of existing bug fixes.
+
+#### 1. Enhanced S24 Detection
+
+**Problem:** Original S24 detection failed when 24-bit tracks start with silence.
+
+**Solution:** Hybrid detection with three layers:
+
+- Sample-based detection (checks both LSB and MSB byte positions)
+- Hint from FFmpeg metadata (fallback for silence)
+- Timeout mechanism (~1 second defaults to LSB)
+
+**Files:**
+
+- `src/DirettaRingBuffer.h` - Added `S24PackMode::Deferred`, hint mechanism, timeout
+- `src/DirettaSync.h` - Added `setS24PackModeHint()` method
+
+#### 2. AVAudioFifo for PCM Overflow
+
+**Problem:** Original overflow handling used `memmove()` with O(n) complexity.
+
+**Solution:** Replaced with FFmpeg's `AVAudioFifo`:
+
+- O(1) circular buffer operations
+- Dynamic sizing based on sample rate (8192 @ 48kHz → 64k+ @ high rates)
+- Separate DSD remainder buffer (`m_dsdPacketRemainder`) from PCM FIFO
+
+| Sample Rate | FIFO Size      |
+| ----------- | -------------- |
+| 48 kHz      | 8,192 samples  |
+| 96 kHz      | 16,384 samples |
+| 192 kHz     | 32,768 samples |
+| 384 kHz     | 65,536 samples |
+
+**Files:**
+
+- `src/AudioEngine.h` - Added `AVAudioFifo* m_pcmFifo`, separated DSD buffer
+- `src/AudioEngine.cpp` - FIFO allocation in `initResampler()`, usage in `readSamples()`
+
+#### 3. PCM Bypass Mode
+
+**Problem:** Audio processed through SwrContext even when formats match exactly.
+
+**Solution:** Bypass mode that skips SwrContext for bit-perfect playback when:
+
+- Sample rates match exactly
+- Channel counts match
+- Format is packed integer (S16 or S32) - NOT planar, NOT float
+- Bit depth matches
+
+**Files:**
+
+- `src/AudioEngine.h` - Added `m_bypassMode`, `canBypass()` method
+- `src/AudioEngine.cpp` - Bypass check in `initResampler()`, explicit bypass path in `readSamples()`
+
+**Expected log output:** `[AudioDecoder] PCM BYPASS enabled - bit-perfect path`
+
+#### 4. S24 Hint Propagation
+
+**Problem:** S24 alignment hint from FFmpeg wasn't reaching the ring buffer.
+
+**Solution:** Propagation path: `TrackInfo` → `DirettaRenderer` → `DirettaSync` → `DirettaRingBuffer`
+
+**Files:**
+
+- `src/AudioEngine.h` - Added `TrackInfo::S24Alignment` enum
+- `src/AudioEngine.cpp` - Detection based on codec ID (PCM_S24, FLAC, ALAC)
+- `src/DirettaRenderer.cpp` - Propagation to `m_direttaSync->setS24PackModeHint()`
+
+---
+
+**Documentation:**
+
+- Summary: [`docs/PCM_FIFO_BYPASS_OPTIMIZATION.md`](docs/PCM_FIFO_BYPASS_OPTIMIZATION.md)
+- Design: [`docs/plans/2026-01-15-pcm-bypass-optimization-design.md`](docs/plans/2026-01-15-pcm-bypass-optimization-design.md)
+
+**Preserved bug fixes:** FFmpeg ABI compatibility, ARM64 compilation, DSD transition silence, DSD per-channel buffers, DSD512 Zen3 warmup.
+
+### DSD Conversion Function Specialization
+
+**Problem:** Per-iteration branch checks inside the DSD conversion hot loop for operations that are constant per-track. At DSD512 (22.5 MHz), this added ~176,000 unnecessary branch predictions per second.
+
+**Root cause:** `convertDSDPlanar_AVX2()` checked `if (bitReversalTable)` and `if (needByteSwap)` on every 32-byte chunk, even though these values never change during playback.
+
+**Solution:** Pre-select specialized conversion function at track open time:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `Passthrough` | Just interleave (fastest) | DSF→LSB target, DFF→MSB target |
+| `BitReverseOnly` | Apply bit reversal | DSF→MSB target, DFF→LSB target |
+| `ByteSwapOnly` | Endianness conversion | Little-endian targets |
+| `BitReverseAndSwap` | Both operations | Little-endian + bit order mismatch |
+
+**Implementation:**
+- Added `DSDConversionMode` enum to `DirettaRingBuffer.h`
+- Created 4 specialized conversion functions (each ~350 lines with AVX2 + scalar fallback):
+  - `convertDSD_Passthrough()` - Zero transformation overhead
+  - `convertDSD_BitReverse()` - Embedded LUT, no null check
+  - `convertDSD_ByteSwap()` - Byte reordering only
+  - `convertDSD_BitReverseSwap()` - Combined operations
+- Added `pushDSDPlanarOptimized()` with switch-case dispatch
+- `configureSinkDSD()` now sets `m_dsdConversionMode` based on source format + sink requirements
+- `sendAudio()` uses optimized path with cached mode
+
+**Files:**
+- `src/DirettaRingBuffer.h` (lines 104-110, 326-364, 557-896)
+- `src/DirettaSync.h` (line 389) - Added `m_dsdConversionMode` member
+- `src/DirettaSync.cpp` (lines 904-975, 1215-1217) - Mode selection and usage
+
+**Documentation:**
+- Summary: [`docs/DSD_CONVERSION_OPTIMIZATION.md`](docs/DSD_CONVERSION_OPTIMIZATION.md)
+- Design: [`docs/plans/2026-01-15-dsd-conversion-optimization-design.md`](docs/plans/2026-01-15-dsd-conversion-optimization-design.md)
+
+---
+
+### PCM Sample Rate Transition Noise Fix
+
+**Problem:** Transition noise when changing sample rates in PCM (e.g., 44.1kHz → 96kHz).
+
+**Root cause:** PCM rate changes used `reopenForFormatChange()` which tries to send silence buffers, but playback is already stopped when the new track arrives, so silence never gets sent. Target's internal buffers still contain old samples at the previous rate.
+
+**Solution:** PCM rate changes now use the same full close/reopen approach as DSD transitions:
+
+| Transition | Action | Delay |
+|------------|--------|-------|
+| PCM rate change | Full close/reopen | 200ms |
+| DSD→PCM | Full close/reopen | 800ms |
+| DSD rate change | Full close/reopen | 400ms |
+| PCM→DSD | reopenForFormatChange() | 800ms |
+
+**Files:**
+- `src/DirettaSync.cpp` (lines 476-522) - Added `isPcmRateChange` detection and full close/reopen path
+
+---
+
+### FLAC Bypass Bug Fix
+
+**Problem:** FLAC files played at twice the normal speed.
+
+**Root cause:** `canBypass()` returned `true` for FLAC because the codec context sample format check passed. However, FLAC always decodes to planar format (`FLTP`/`S32P`), which requires conversion through SwrContext.
+
+**Solution:** Added explicit check for compressed formats at the start of `canBypass()`:
+
+```cpp
+if (m_trackInfo.isCompressed) {
+    DEBUG_LOG("[AudioDecoder] canBypass: NO (compressed format requires decoding)");
+    return false;
+}
+```
+
+**Files:**
+- `src/AudioEngine.cpp` (lines 295-299) - Added `isCompressed` check in `canBypass()`
+
+---
+
 ## 2026-01-15
+
+### FFmpeg ABI Compatibility Fix
+
+**Problem:** Segmentation fault when running against FFmpeg 5.x libraries after compiling on a system with FFmpeg 7.x development headers. Crash occurred in `AudioDecoder::open()` when accessing `AVStream->codecpar`.
+
+**Root cause:**
+- Compile-time FFmpeg headers (libavformat 61.x from FFmpeg 7.x) have different `AVStream` structure layout than runtime libraries (libavformat 59.x from FFmpeg 5.x)
+- The `codecpar` field offset differs between versions, causing garbage pointer dereference
+- Debug output showed: `codecpar=0x5622000000001` (garbage) instead of valid pointer
+
+**Solution - Multi-layered approach:**
+
+1. **AudioEngine.cpp** - Safer stream detection:
+   - Replaced manual stream iteration loop with `av_find_best_stream()` (FFmpeg's recommended API)
+   - Added NULL checks for `audioStream` and `audioStream->codecpar` after retrieval
+   - Handles edge cases in FFmpeg 5.x where codecpar may be invalid
+
+2. **install.sh** - Automatic header management:
+   - Added `download_ffmpeg_headers()` - downloads FFmpeg source for headers only
+   - Added `check_ffmpeg_abi_compatibility()` - detects runtime vs compile-time version mismatch
+   - Added `ensure_ffmpeg_headers()` - auto-downloads correct headers when needed
+   - Added `detect_ffmpeg_runtime_version()` and `get_ffmpeg_target_version()` for auto-detection
+   - `build_renderer()` now automatically uses `make FFMPEG_PATH=./ffmpeg-headers`
+   - FFmpeg installation now offers both **5.1.2** and **7.1** (recommended) build options
+   - Selected version saved to `.ffmpeg-version` for future builds
+   - New config variables: `FFMPEG_HEADERS_DIR`, `FFMPEG_TARGET_VERSION`
+
+3. **Makefile** - Auto-detection and warnings:
+   - Auto-detects `./ffmpeg-headers/` directory (created by install.sh)
+   - Shows clear warning box when using system headers
+   - Supports explicit override: `make FFMPEG_PATH=/path/to/headers`
+
+4. **New .gitignore** - Excludes downloaded headers from version control
+
+**Usage:**
+```bash
+# Option A: Use install.sh (recommended - auto-downloads headers)
+./install.sh --build
+
+# Option B: Manual download
+wget https://ffmpeg.org/releases/ffmpeg-5.1.2.tar.xz
+tar xf ffmpeg-5.1.2.tar.xz
+mv ffmpeg-5.1.2 ffmpeg-headers
+make clean && make
+
+# Option C: Explicit path
+make clean && make FFMPEG_PATH=/path/to/ffmpeg-5.1.2
+```
+
+**Files:**
+- `src/AudioEngine.cpp` (lines 139-171) - Stream detection rewrite
+- `install.sh` (lines 512-656) - Header download functions
+- `install.sh` (lines 721-734) - Build with correct headers
+- `Makefile` (lines 181-229) - FFmpeg path auto-detection
+- `.gitignore` - New file
+
+---
+
+### ARM64 Compilation Fix
+
+**Problem:** Build failed on ARM64 (aarch64) with `fatal error: immintrin.h: No such file or directory`. The `immintrin.h` header is x86-only (AVX/SSE intrinsics) and doesn't exist on ARM64 systems.
+
+**Solution:** Added architecture detection and conditional compilation throughout `DirettaRingBuffer.h`:
+
+1. **Architecture detection macro:**
+   ```cpp
+   #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+       #define DIRETTA_HAS_AVX2 1
+       #include <immintrin.h>
+   #else
+       #define DIRETTA_HAS_AVX2 0
+   #endif
+   ```
+
+2. **Conditional AVX2 functions:**
+   - `convert24BitPacked_AVX2()` - x86 AVX2 with scalar fallback
+   - `convert24BitPackedShifted_AVX2()` - x86 AVX2 with scalar fallback
+   - `convert16To32_AVX2()` - x86 AVX2 with scalar fallback
+   - `convertDSDPlanar_AVX2()` - x86 AVX2 with scalar fallback (uses `convertDSDPlanar_Scalar()`)
+   - `simd_bit_reverse()` - x86-only helper (guarded)
+
+3. **Scalar fallbacks for ARM64:**
+   - Pure C++ implementations for all conversion functions
+   - Uses existing `convertDSDPlanar_Scalar()` for DSD processing
+   - `memcpyfast_audio.h` already had ARM64 support (uses `std::memcpy`)
+
+**Performance note:** ARM64 builds use scalar code paths which are still efficient due to:
+- GCC/Clang NEON auto-vectorization for simple loops
+- Standard library optimizations in `std::memcpy`
+
+**Files:**
+- `src/DirettaRingBuffer.h` - Architecture guards and scalar fallbacks
+
+---
 
 ### Pre-Transition Silence for DSD Format Changes
 
@@ -50,6 +303,10 @@
 - Increasing silence buffer multiplier
 - Adjusting timeout scaling
 - Adding post-silence delay before `stopPlayback()`
+
+
+
+---
 
 ## 2026-01-14
 

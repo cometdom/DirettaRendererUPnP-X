@@ -238,6 +238,19 @@ bool DirettaRenderer::start() {
                         std::cerr << "[Callback] Failed to open DirettaSync" << std::endl;
                         return false;
                     }
+
+                    // Propagate S24 alignment hint to ring buffer for 24-bit PCM
+                    // This helps detection when track starts with silence
+                    if (!format.isDSD && bitDepth == 24 &&
+                        trackInfo.s24Alignment != TrackInfo::S24Alignment::Unknown) {
+                        DirettaRingBuffer::S24PackMode hint =
+                            (trackInfo.s24Alignment == TrackInfo::S24Alignment::LsbAligned)
+                                ? DirettaRingBuffer::S24PackMode::LsbAligned
+                                : DirettaRingBuffer::S24PackMode::MsbAligned;
+                        m_direttaSync->setS24PackModeHint(hint);
+                        DEBUG_LOG("[Callback] Set S24 hint: "
+                                  << (hint == DirettaRingBuffer::S24PackMode::LsbAligned ? "LSB" : "MSB"));
+                    }
                 }
 
                 // Send audio (DirettaSync handles all format conversions)

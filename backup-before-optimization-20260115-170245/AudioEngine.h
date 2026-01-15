@@ -13,7 +13,6 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswresample/swresample.h>
-#include <libavutil/audio_fifo.h>
 }
 
 /**
@@ -35,15 +34,9 @@ struct TrackInfo {
     enum class DSDSourceFormat { Unknown, DSF, DFF };
     DSDSourceFormat dsdSourceFormat;
 
-    // 24-bit alignment hint from FFmpeg (for S24_P32 packing)
-    // This is a HINT only - sample-based detection in ring buffer takes priority
-    enum class S24Alignment { Unknown, LsbAligned, MsbAligned };
-    S24Alignment s24Alignment;
-
     TrackInfo() : sampleRate(0), bitDepth(0), channels(2), duration(0),
                   isDSD(false), dsdRate(0), isCompressed(true),
-                  dsdSourceFormat(DSDSourceFormat::Unknown),
-                  s24Alignment(S24Alignment::Unknown) {}
+                  dsdSourceFormat(DSDSourceFormat::Unknown) {}
 };
 
 /**
@@ -135,21 +128,17 @@ private:
     AVPacket* m_packet;      // Reusable for raw packet reading (DSD and PCM)
     AVFrame* m_frame;        // Reusable for decoded frames (PCM) - eliminates per-call alloc
 
-    // DSD packet remainder buffer (for incomplete packet fragments)
-    // Stores leftover bytes when DSD packets don't align with request size
-    AudioBuffer m_dsdPacketRemainder;
-    size_t m_dsdRemainderCount = 0;
-
-    // PCM FIFO for sample overflow (O(1) circular buffer)
-    // Replaces memmove-based overflow handling with efficient FIFO
-    AVAudioFifo* m_pcmFifo = nullptr;
+    // CRITICAL: Buffer interne pour les samples excédentaires
+    // Quand une frame décodée contient plus de samples que demandé,
+    // on garde l'excédent ici pour le prochain appel
+    AudioBuffer m_remainingSamples;
+    size_t m_remainingCount;
 
     // Reusable resample buffer (eliminates per-call allocation)
     AudioBuffer m_resampleBuffer;
     size_t m_resampleBufferCapacity = 0;
 
     // Pre-allocated DSD channel buffers (eliminates per-call std::vector allocation)
-    // Uses per-channel separation for optimal cache behavior
     AudioBuffer m_dsdLeftBuffer;
     AudioBuffer m_dsdRightBuffer;
     size_t m_dsdBufferCapacity = 0;
@@ -161,13 +150,7 @@ private:
     int m_packetCount = 0;                // DSD packet counter
     bool m_resamplerInitLogged = false;   // Resampler init logged (open())
 
-    // PCM bypass mode - skip resampler when formats match exactly
-    // Enables bit-perfect playback for matching integer formats
-    bool m_bypassMode = false;
-    bool m_resamplerInitialized = false;
-
     bool initResampler(uint32_t outputRate, uint32_t outputBits);
-    bool canBypass(uint32_t outputRate, uint32_t outputBits) const;
 };
 
 /**
