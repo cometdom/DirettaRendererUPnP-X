@@ -1,5 +1,87 @@
 # Changelog
 
+## 2026-01-16
+
+### FFmpeg 8.0.1 Minimal Build Option
+
+Added FFmpeg 8.0.1 as the new recommended build option in `install.sh` with a minimal audio-only configuration.
+
+**New option 3 (default):** Build FFmpeg 8.0.1 minimal
+- Smallest footprint with `--disable-everything` base
+- Installs to `/usr` (system-wide) vs `/usr/local`
+- Only essential audio components enabled
+
+**Configuration:**
+```
+--prefix=/usr
+--enable-shared
+--disable-static
+--enable-small
+--enable-gpl
+--enable-version3
+--enable-gnutls
+--disable-everything
+--disable-doc
+--disable-avdevice
+--disable-swscale
+--enable-protocol=file,http,https,tcp
+--enable-demuxer=flac,wav,dsf,dff,aac,mov
+--enable-decoder=flac,alac,pcm_s16le,pcm_s24le,pcm_s32le,dsd_lsbf,dsd_msbf,dsd_lsbf_planar,dsd_msbf_planar,aac
+--enable-muxer=flac,wav
+--enable-filter=aresample
+```
+
+**Supported formats:**
+| Format | Container | Decoder |
+|--------|-----------|---------|
+| FLAC | flac | flac |
+| WAV | wav | pcm_s16le/s24le/s32le |
+| ALAC | mov | alac |
+| AAC/M4A | mov | aac |
+| DSF (DSD) | dsf | dsd_lsbf, dsd_lsbf_planar |
+| DFF (DSD) | dff | dsd_msbf, dsd_msbf_planar |
+
+**Changes to install.sh:**
+- Added `get_ffmpeg_8_minimal_opts()` function
+- Added `build_ffmpeg_8_minimal()` function
+- Added `install_ffmpeg_8_build_deps()` (minimal: gnutls only)
+- Updated ABI compatibility mapping for FFmpeg 8 (libavformat 62)
+- Renumbered menu options (8.0.1 is now option 3, default)
+- Removed `--disable-postproc` (not valid in FFmpeg 8.x)
+
+**Files:** `install.sh`
+
+---
+
+## 2026-01-15 (Session 3) - TEST BUILD
+
+### Format Transition Noise Investigation
+
+**Purpose:** Test build to diagnose switching noise during format transitions. Pre-transition silence buffers were suspected of contributing to the noise rather than preventing it.
+
+**Changes:**
+
+| Setting | Original | Test Value |
+|---------|----------|------------|
+| Pre-transition silence | Enabled (100-1000 buffers) | **Disabled** |
+| DSD→PCM delay | 800ms | **400ms** |
+| DSD rate change delay | 400ms | 400ms (unchanged) |
+| PCM rate change delay | 200ms | **100ms** |
+
+**Files modified:**
+- `src/DirettaSync.cpp`:
+  - `sendPreTransitionSilence()` (line 1140-1142) - Early return added
+  - `reopenForFormatChange()` (line 730-758) - Silence wrapped in `#if 0`
+  - DSD→PCM delay (line 459) - Reduced from 800 to 400
+  - PCM rate change delay (line 506) - Reduced from 200 to 100
+
+**To revert:**
+1. Remove early `return` in `sendPreTransitionSilence()`
+2. Change `#if 0` to `#if 1` in `reopenForFormatChange()`
+3. Restore delay values: DSD→PCM=800, PCM rate=200
+
+---
+
 ## 2026-01-15 (Session 2)
 
 ### PCM FIFO and Bypass Optimization (thanks to @leeeanh)

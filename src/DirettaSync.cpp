@@ -454,9 +454,9 @@ bool DirettaSync::open(const AudioFormat& format) {
                 m_paused = false;
 
                 // Extended delay for target to fully reset
-                // DSD→PCM needs full 800ms for clock domain switch
+                // DSD→PCM needs delay for clock domain switch (TEST: reduced from 800 to 400)
                 // DSD rate downgrade needs 400ms to flush internal buffers
-                int resetDelayMs = nowPCM ? 800 : 400;
+                int resetDelayMs = nowPCM ? 400 : 400;
                 std::cout << "[DirettaSync] Waiting " << resetDelayMs
                           << "ms for target to reset..." << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(resetDelayMs));
@@ -502,8 +502,8 @@ bool DirettaSync::open(const AudioFormat& format) {
                 m_playing = false;
                 m_paused = false;
 
-                // Shorter delay for PCM rate change (no clock domain switch needed)
-                int resetDelayMs = 200;
+                // Shorter delay for PCM rate change (TEST: reduced from 200 to 100)
+                int resetDelayMs = 100;
                 std::cout << "[DirettaSync] Waiting " << resetDelayMs
                           << "ms for target to reset..." << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(resetDelayMs));
@@ -724,6 +724,10 @@ void DirettaSync::release() {
 }
 
 bool DirettaSync::reopenForFormatChange() {
+    // TEST: Disabled pre-transition silence to diagnose switching noise
+    DIRETTA_LOG("reopenForFormatChange: silence DISABLED FOR TESTING, stopping immediately...");
+
+#if 0  // Disabled for testing
     DIRETTA_LOG("reopenForFormatChange: sending silence before format switch...");
 
     // Send silence buffers to let DAC mute gracefully before format change
@@ -751,6 +755,7 @@ bool DirettaSync::reopenForFormatChange() {
         }
         std::this_thread::yield();
     }
+#endif
 
     DIRETTA_LOG("reopenForFormatChange: stopping...");
 
@@ -1137,6 +1142,10 @@ void DirettaSync::resumePlayback() {
 }
 
 void DirettaSync::sendPreTransitionSilence() {
+    // TEST: Disabled pre-transition silence to diagnose switching noise
+    DIRETTA_LOG("sendPreTransitionSilence: DISABLED FOR TESTING");
+    return;
+
     if (!m_playing.load(std::memory_order_acquire)) {
         DIRETTA_LOG("sendPreTransitionSilence: not playing, skipping");
         return;

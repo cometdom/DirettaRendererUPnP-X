@@ -135,14 +135,26 @@ The following functions are in the critical audio path:
 AudioEngine::readSamples()
     └─▶ DirettaSync::sendAudio()
             └─▶ RingAccessGuard (atomic increment)
-            └─▶ DirettaRingBuffer::push*()
+            └─▶ DirettaRingBuffer::push*() or pushDSDPlanarOptimized()
                     └─▶ AVX2 format conversion (staging buffer)
+                    └─▶ For DSD: switch(m_dsdConversionMode) - no per-iteration branches
                     └─▶ memcpy_audio_fixed() to ring
 
 DirettaSync::getNewStream()  [SDK callback, runs in SDK thread]
     └─▶ DirettaRingBuffer::pop()
             └─▶ memcpy_audio() to DIRETTA::Stream
 ```
+
+### DSD Conversion Mode Selection
+
+Mode is determined once at track open in `configureSinkDSD()`:
+
+| Mode | Bit Reverse | Byte Swap | Use Case |
+|------|-------------|-----------|----------|
+| `Passthrough` | No | No | DSF→LSB target, DFF→MSB target |
+| `BitReverseOnly` | Yes | No | DSF→MSB target, DFF→LSB target |
+| `ByteSwapOnly` | No | Yes | Little-endian targets |
+| `BitReverseAndSwap` | Yes | Yes | Little-endian + bit mismatch |
 
 **Rules for hot path code:**
 - No heap allocations (reuse `m_packet`, `m_frame`, staging buffers)
@@ -192,7 +204,7 @@ class ReconfigureGuard {
 | PCM | 16-bit | 44.1kHz - 384kHz | `push16To32()` | AVX2 16x |
 | PCM | 24-bit | 44.1kHz - 384kHz | `push24BitPacked()` | AVX2 8x |
 | PCM | 32-bit | 44.1kHz - 384kHz | `push()` | memcpy |
-| DSD | 1-bit | DSD64 - DSD512 | `pushDSDPlanar()` | AVX2 32x |
+| DSD | 1-bit | DSD64 - DSD512 | `pushDSDPlanarOptimized()` | AVX2 32x |
 
 ### S24 Format Auto-Detection
 
@@ -209,8 +221,10 @@ All format conversions use 64-byte aligned staging buffers before writing to the
 | 24-bit pack (LSB) | `convert24BitPacked_AVX2()` | 8 samples/instruction |
 | 24-bit pack (MSB) | `convert24BitPackedShifted_AVX2()` | 8 samples/instruction |
 | 16→32 upsample | `convert16To32_AVX2()` | 16 samples/instruction |
-| DSD planar→interleaved | `convertDSDPlanar_AVX2()` | 32 bytes/instruction |
-| DSD bit reversal | `simd_bit_reverse()` | 32 bytes/instruction |
+| DSD planar→interleaved | `convertDSD_Passthrough()` | 32 bytes/instruction |
+| DSD bit reversal | `convertDSD_BitReverse()` | 32 bytes/instruction |
+| DSD byte swap | `convertDSD_ByteSwap()` | 32 bytes/instruction |
+| DSD bit reverse + swap | `convertDSD_BitReverseSwap()` | 32 bytes/instruction |
 
 ## Buffer Configuration
 
@@ -350,10 +364,12 @@ sudo apt install build-essential libavformat-dev libavcodec-dev libavutil-dev li
 - [x] Lock-free audio path with `RingAccessGuard`
 - [x] Power-of-2 bitmask modulo in ring buffer (`mask_ = size_ - 1`)
 - [x] Cache-line separated atomics (`alignas(64)`)
-- [x] S24 pack mode auto-detection
+- [x] S24 pack mode auto-detection with hint propagation
 - [x] DSD byte swap for little-endian targets
 - [x] Full format transition with `reopenForFormatChange()`
 - [x] DSD→PCM transition fix (800ms settling for I2S targets)
+- [x] DSD rate change transition fix (full close/reopen)
+- [x] PCM rate change transition fix (full close/reopen with 200ms delay)
 - [x] AVX2 SIMD format conversions (24-bit pack, 16→32, DSD interleave)
 - [x] Low-latency buffer mode (~300ms PCM)
 - [x] 500µs micro-sleep flow control
@@ -361,6 +377,12 @@ sudo apt install build-essential libavformat-dev libavcodec-dev libavutil-dev li
 - [x] ARM64 compatibility (auto-vectorized `std::memcpy`)
 - [x] Playlist end target release fix
 - [x] UPnP Stop closes Diretta connection properly
+- [x] PCM FIFO with AVAudioFifo (O(1) circular buffer)
+- [x] PCM bypass mode for bit-perfect playback
+- [x] FLAC bypass bug fix (compressed formats never bypass)
+- [x] DSD conversion function specialization (4 modes, no per-iteration branches)
+- [x] Pre-transition silence for DSD format changes
+- [x] DSD512 Zen3 warmup fix (MTU-aware buffer scaling)
 
 ### Potential Future Work
 - [ ] AVX-512 format conversions (currently only memcpy uses AVX-512)
@@ -370,16 +392,16 @@ sudo apt install build-essential libavformat-dev libavcodec-dev libavutil-dev li
 
 ## Format Transition Handling
 
-From `PLAN-DSD-PCM-TRANSITION.md`:
+| From | To | Handling | Delay |
+|------|-----|----------|-------|
+| PCM | Same PCM (same rate) | Quick resume (buffer clear) | None |
+| PCM | PCM (rate change) | Full `close()` + fresh `open()` | 200ms |
+| PCM | DSD | `reopenForFormatChange()` | 800ms |
+| DSD | Same DSD (same rate) | Quick resume (buffer clear) | None |
+| DSD | DSD (rate change) | Full `close()` + fresh `open()` | 400ms |
+| **DSD** | **PCM** | **Full `close()` + fresh `open()`** | **800ms** |
 
-| From | To | Handling |
-|------|-----|----------|
-| PCM | Same PCM | Quick resume (buffer clear) |
-| PCM | Different PCM | `reopenForFormatChange()` |
-| PCM | DSD | `reopenForFormatChange()` |
-| DSD | Same DSD | Quick resume (buffer clear) |
-| DSD | Different DSD | `reopenForFormatChange()` |
-| **DSD** | **PCM** | **Full `close()` + 600ms + fresh `open()`** (I2S targets) |
+**Pre-transition silence:** Before stopping DSD playback, `sendPreTransitionSilence()` sends rate-scaled silence buffers (100 × rate_multiplier) to flush the Diretta pipeline.
 
 ## Troubleshooting
 
@@ -413,10 +435,14 @@ When modifying this codebase:
 
 | Document | Purpose |
 |----------|---------|
-| `PCM_OPTIMIZATION_CHANGES.md` | Low-latency PCM optimizations, buffer tuning, flow control |
-| `SIMD_OPTIMIZATION_CHANGES.md` | AVX2/AVX-512 SIMD, lock-free patterns, ring buffer |
-| `FORK_CHANGES.md` | Detailed diff from original v1.2.1 |
-| `PLAN-DSD-PCM-TRANSITION.md` | DSD→PCM transition fix plan |
+| `docs/PCM_FIFO_BYPASS_OPTIMIZATION.md` | PCM FIFO, bypass mode, S24 detection |
+| `docs/DSD_CONVERSION_OPTIMIZATION.md` | DSD conversion specialization (4 modes) |
+| `docs/DSD_BUFFER_OPTIMIZATION.md` | DSD buffer pre-allocation, rate-adaptive chunks |
+| `docs/PCM_OPTIMIZATION_CHANGES.md` | Low-latency PCM optimizations, buffer tuning |
+| `docs/SIMD_OPTIMIZATION_CHANGES.md` | AVX2/AVX-512 SIMD, lock-free patterns |
+| `docs/FORK_CHANGES.md` | Detailed diff from original v1.2.1 |
+| `docs/plans/` | Design documents for each optimization |
+| `CHANGELOG.md` | Chronological change history |
 | `README.md` | User documentation |
 | `docs/TROUBLESHOOTING.md` | User troubleshooting guide |
 | `docs/CONFIGURATION.md` | Configuration reference |
