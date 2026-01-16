@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-01-16
+
+### FFmpeg 8.0.1 Minimal Build Option
+
+Added FFmpeg 8.0.1 as the new recommended build option in `install.sh` with a minimal audio-only configuration.
+
+**New option 3 (default):** Build FFmpeg 8.0.1 minimal
+- Smallest footprint with `--disable-everything` base
+- Installs to `/usr` (system-wide) vs `/usr/local`
+- Only essential audio components enabled
+
+**Configuration:**
+```
+--prefix=/usr
+--enable-shared
+--disable-static
+--enable-small
+--enable-gpl
+--enable-version3
+--enable-gnutls
+--disable-everything
+--disable-doc
+--disable-avdevice
+--disable-swscale
+--enable-protocol=file,http,https,tcp
+--enable-demuxer=flac,wav,dsf,dff,aac,mov
+--enable-decoder=flac,alac,pcm_s16le,pcm_s24le,pcm_s32le,dsd_lsbf,dsd_msbf,dsd_lsbf_planar,dsd_msbf_planar,aac
+--enable-muxer=flac,wav
+--enable-filter=aresample
+```
+
+**Supported formats:**
+| Format | Container | Decoder |
+|--------|-----------|---------|
+| FLAC | flac | flac |
+| WAV | wav | pcm_s16le/s24le/s32le |
+| ALAC | mov | alac |
+| AAC/M4A | mov | aac |
+| DSF (DSD) | dsf | dsd_lsbf, dsd_lsbf_planar |
+| DFF (DSD) | dff | dsd_msbf, dsd_msbf_planar |
+
+**Changes to install.sh:**
+- Added `get_ffmpeg_8_minimal_opts()` function
+- Added `build_ffmpeg_8_minimal()` function
+- Added `install_ffmpeg_8_build_deps()` (minimal: gnutls only)
+- Updated ABI compatibility mapping for FFmpeg 8 (libavformat 62)
+- Renumbered menu options (8.0.1 is now option 3, default)
+- Removed `--disable-postproc` (not valid in FFmpeg 8.x)
+
+**Files:** `install.sh`
+
+---
+
 ## 2026-01-15 (Session 3) - TEST BUILD
 
 ### Format Transition Noise Investigation
