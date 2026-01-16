@@ -1143,8 +1143,8 @@ void DirettaSync::resumePlayback() {
 
 void DirettaSync::sendPreTransitionSilence() {
     // TEST: Disabled pre-transition silence to diagnose switching noise
-    DIRETTA_LOG("sendPreTransitionSilence: DISABLED FOR TESTING");
-    return;
+    // DIRETTA_LOG("sendPreTransitionSilence: DISABLED FOR TESTING");
+    // return;
 
     if (!m_playing.load(std::memory_order_acquire)) {
         DIRETTA_LOG("sendPreTransitionSilence: not playing, skipping");

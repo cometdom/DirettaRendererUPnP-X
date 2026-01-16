@@ -75,16 +75,15 @@ struct AudioFormat {
 
 namespace DirettaBuffer {
     constexpr float DSD_BUFFER_SECONDS = 0.8f;
-    constexpr float PCM_BUFFER_SECONDS = 0.3f;  // Was 1.0f - low latency
-
+    constexpr float PCM_BUFFER_SECONDS = 1.0f;  // // v1.3.1: Streaming-friendly
     constexpr size_t DSD_PREFILL_MS = 50;
-    constexpr size_t PCM_PREFILL_MS = 30;       // Was 50 - faster start
+    constexpr size_t PCM_PREFILL_MS = 50;       // Was 50 - faster start
     constexpr size_t PCM_LOWRATE_PREFILL_MS = 100;
 
     constexpr unsigned int DAC_STABILIZATION_MS = 300;
     constexpr unsigned int ONLINE_WAIT_MS = 2000;
     constexpr unsigned int FORMAT_SWITCH_DELAY_MS = 800;
-    constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 50;
+    constexpr unsigned int POST_ONLINE_SILENCE_BUFFERS = 5;
 
     // UPnP push model needs larger buffers than MPD's pull model
     // 64KB = ~370ms floor at 44.1kHz/16-bit, negligible at higher rates
