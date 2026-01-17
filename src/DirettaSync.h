@@ -70,6 +70,30 @@ struct AudioFormat {
 };
 
 //=============================================================================
+// Retry Configuration
+//=============================================================================
+
+namespace DirettaRetry {
+    // Connection establishment (DIRETTA::Sync::open)
+    constexpr int OPEN_RETRIES = 3;
+    constexpr int OPEN_DELAY_MS = 500;
+
+    // setSink configuration
+    constexpr int SETSINK_RETRIES_FULL = 20;      // After disconnect
+    constexpr int SETSINK_RETRIES_QUICK = 15;     // Quick reconfigure
+    constexpr int SETSINK_DELAY_FULL_MS = 500;
+    constexpr int SETSINK_DELAY_QUICK_MS = 300;
+
+    // connect() call
+    constexpr int CONNECT_RETRIES = 3;
+    constexpr int CONNECT_DELAY_MS = 500;
+
+    // Format change reopen
+    constexpr int REOPEN_SINK_RETRIES = 10;
+    constexpr int REOPEN_SINK_DELAY_MS = 500;
+}
+
+//=============================================================================
 // Buffer Configuration
 //=============================================================================
 
@@ -387,6 +411,20 @@ private:
     // Cached DSD conversion mode - set at track open, eliminates per-iteration branch checks
     DirettaRingBuffer::DSDConversionMode m_dsdConversionMode{DirettaRingBuffer::DSDConversionMode::Passthrough};
 
+    // Format generation counter - incremented on ANY format change
+    // Allows sendAudio to skip reloading atomics when format hasn't changed
+    std::atomic<uint32_t> m_formatGeneration{0};
+
+    // Cached format values for sendAudio fast path (updated when generation changes)
+    // Protected by generation counter check - no race with configureRingXXX
+    uint32_t m_cachedFormatGen{0};
+    bool m_cachedDsdMode{false};
+    bool m_cachedPack24bit{false};
+    bool m_cachedUpsample16to32{false};
+    int m_cachedChannels{2};
+    int m_cachedBytesPerSample{2};
+    DirettaRingBuffer::DSDConversionMode m_cachedDsdConversionMode{DirettaRingBuffer::DSDConversionMode::Passthrough};
+
     // Prefill and stabilization
     size_t m_prefillTarget = 0;
     std::atomic<bool> m_prefillComplete{false};
@@ -397,6 +435,7 @@ private:
     // Statistics
     std::atomic<int> m_streamCount{0};
     std::atomic<int> m_pushCount{0};
+    std::atomic<uint32_t> m_underrunCount{0};
 };
 
 #endif // DIRETTA_SYNC_H

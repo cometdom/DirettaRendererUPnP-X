@@ -127,6 +127,13 @@ else
     NOLOG_SUFFIX =
 endif
 
+# Optional DSD diagnostics (heavy logging for DSD debugging)
+# Usage: make DSD_DIAG=1
+ifdef DSD_DIAG
+    CXXFLAGS += -DDIRETTA_DSD_DIAGNOSTICS
+    $(info DSD diagnostics: ENABLED)
+endif
+
 DIRETTA_LIB_NAME = libDirettaHost_$(FULL_VARIANT)$(NOLOG_SUFFIX).a
 ACQUA_LIB_NAME   = libACQUA_$(FULL_VARIANT)$(NOLOG_SUFFIX).a
 
