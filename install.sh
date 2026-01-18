@@ -13,7 +13,7 @@ set -e  # Exit on error
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SDK_PATH="${DIRETTA_SDK_PATH:-$HOME/DirettaHostSDK_147}"
+SDK_PATH="${DIRETTA_SDK_PATH:-$HOME/DirettaHostSDK_148}"
 FFMPEG_BUILD_DIR="/tmp/ffmpeg-build"
 FFMPEG_HEADERS_DIR="$SCRIPT_DIR/ffmpeg-headers"
 FFMPEG_TARGET_VERSION="8.0.1"
